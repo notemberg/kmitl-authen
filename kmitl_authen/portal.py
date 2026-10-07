@@ -52,6 +52,7 @@ class Result:
     detail: str = ""
     status_code: int | None = None
     latency_ms: int = 0
+    body: str = ""      # the raw response snippet, kept for diagnosis
 
     @property
     def ok(self) -> bool:
@@ -90,18 +91,23 @@ def _classify(payload: dict[str, Any] | None, snippet: str) -> tuple[str, str]:
         return Outcome.BAD_CREDENTIALS, "portal rejected the credentials"
 
     if payload is not None:
-        for key in ("success", "result", "status", "code"):
+        # Only unambiguously-named verdict fields are trusted. "code" and
+        # "status" are deliberately NOT consulted: `code: 0` means success in
+        # most portal APIs and failure in others, and guessing wrong here would
+        # mislabel every single login. The connectivity probe is the real
+        # source of truth, so an unrecognised body is reported as OK and the
+        # next probe settles it.
+        for key in ("success", "result"):
             if key not in payload:
                 continue
             value = payload[key]
             if isinstance(value, bool):
                 return (Outcome.OK, "") if value else (Outcome.REJECTED, f"{key}=false")
             text = str(value).strip().lower()
-            if text in ("1", "true", "ok", "success", "0000", "200"):
+            if text in ("1", "true", "ok", "success", "yes"):
                 return Outcome.OK, ""
-            if text in ("0", "false", "fail", "failed", "error"):
+            if text in ("0", "false", "fail", "failed", "error", "no"):
                 return Outcome.REJECTED, f"{key}={value}"
-        # A JSON object with no verdict field: the portal accepted the post.
         return Outcome.OK, ""
     return Outcome.REJECTED, "non-JSON response"
 
@@ -214,6 +220,18 @@ class Portal:
             return False, f"captive portal response (HTTP {response.status_code})"
         return False, "all probes unreachable"
 
+    def probe_one(self, url: str) -> tuple[bool, str]:
+        """Probe exactly one URL. Used by ``doctor`` to report each in turn."""
+        saved = self.cfg.probe_urls
+        saved_index = self._probe_index
+        self.cfg.probe_urls = [url]
+        self._probe_index = 0
+        try:
+            return self.check_internet()
+        finally:
+            self.cfg.probe_urls = saved
+            self._probe_index = saved_index
+
     # -- portal operations -------------------------------------------------
     def login(self, ip_address: str) -> Result:
         params = {
@@ -259,7 +277,8 @@ class Portal:
 
         outcome, detail = _classify(payload, snippet)
         self._capture_token(payload)
-        return Result(outcome, detail or snippet[:160], response.status_code, latency)
+        return Result(outcome, detail or snippet[:160], response.status_code, latency,
+                      body=snippet)
 
     def _capture_token(self, payload: dict[str, Any] | None) -> None:
         """Carry an anti-CSRF token forward if the portal issued one."""
@@ -296,13 +315,14 @@ class Portal:
             )
 
         latency = int((time.monotonic() - started) * 1000)
+        snippet = _body_snippet(response, 160)
         if response.status_code == 200:
-            return Result(Outcome.OK, "", response.status_code, latency)
+            return Result(Outcome.OK, "", response.status_code, latency, body=snippet)
         if response.status_code >= 500:
             return Result(Outcome.NETWORK_ERROR, f"HTTP {response.status_code}",
-                          response.status_code, latency)
-        return Result(Outcome.REJECTED, _body_snippet(response, 160),
-                      response.status_code, latency)
+                          response.status_code, latency, body=snippet)
+        return Result(Outcome.REJECTED, snippet, response.status_code, latency,
+                      body=snippet)
 
     def logout(self) -> Result:
         started = time.monotonic()
@@ -323,5 +343,6 @@ class Portal:
                 latency_ms=int((time.monotonic() - started) * 1000),
             )
         latency = int((time.monotonic() - started) * 1000)
+        snippet = _body_snippet(response, 160)
         outcome = Outcome.OK if response.status_code == 200 else Outcome.REJECTED
-        return Result(outcome, _body_snippet(response, 160), response.status_code, latency)
+        return Result(outcome, snippet, response.status_code, latency, body=snippet)

@@ -293,3 +293,48 @@ def test_heartbeat_network_error_does_not_cause_a_login_storm(daemon):
     rate = logins / max(elapsed, 1e-9)
     assert rate < 1.0, f"{logins} logins across {elapsed:.1f}s = {rate:.1f}/s"
     assert all(s >= MIN_TICK for s in sleeps)
+
+
+def test_credential_failures_must_be_consecutive_to_stop_the_daemon(daemon):
+    """Scattered rejections must not add up to "the password is wrong".
+
+    The real portal's verdict field is not fully known (a 200 with falsy
+    `success` was observed on logins that worked), so a misread body has to be
+    survivable rather than permanently stopping the daemon.
+    """
+    daemon.cfg.max_credential_failures = 3
+    bad = Result(Outcome.BAD_CREDENTIALS, "userPassError")
+
+    for _ in range(3):
+        # One bad-looking login...
+        daemon.portal = ScriptedPortal(online=False, login_result=bad)
+        daemon._tick(0.0)
+        assert daemon.state != State.BLOCKED
+        # ...then real connectivity proves the credentials were fine.
+        daemon.portal = ScriptedPortal(online=True)
+        daemon._tick(time.monotonic() + 999)
+        assert daemon.consecutive_credential_failures == 0
+
+    assert daemon.counters.credential_failures_total == 3   # still counted
+    assert daemon.state != State.BLOCKED                   # but never blocked
+
+
+def test_connectivity_outranks_the_portals_own_verdict(daemon):
+    daemon.consecutive_credential_failures = 2
+    daemon.portal = ScriptedPortal(online=True)
+    daemon._tick(time.monotonic() + 999)
+    assert daemon.consecutive_credential_failures == 0
+
+
+def test_a_rejected_login_still_recovers_if_the_probe_says_online(daemon):
+    """A login the portal reports as failed, but which actually worked."""
+    daemon.portal = ScriptedPortal(online=False,
+                                   login_result=Result(Outcome.REJECTED, "success=false"))
+    daemon.portal.login_result = Result(Outcome.REJECTED, "success=false")
+    daemon._tick(0.0)
+    assert daemon.state == State.BACKOFF
+    # The gate did open, whatever the body said.
+    daemon.portal.online = True
+    daemon._tick(0.0)
+    assert daemon.state == State.ONLINE
+    assert daemon.backoff == daemon.cfg.backoff_initial

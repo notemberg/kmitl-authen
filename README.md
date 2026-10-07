@@ -26,9 +26,28 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 117 |
+| Tests | none | 129 |
 
 ---
+
+## First thing to run, on campus
+
+Everything here was developed **off the campus network**, against a local fake
+portal. The loop, the timeouts, the watchdog and the control plane are tested;
+the real portal's request and response shapes are *inferred* from the previous
+script and from a run log. `doctor` is how you check that in one shot:
+
+```bash
+python3 -m kmitl_authen doctor
+```
+
+It prints the identity it would present, each connectivity probe, and then the
+**raw body** the portal returns for a login and a heartbeat, next to the
+verdict this code infers from it. If those two disagree, the raw body is the
+thing to share — see [What is verified](#what-is-verified).
+
+Use `doctor --no-login` to check connectivity and identity without touching the
+portal at all.
 
 ## Quick start
 
@@ -273,6 +292,7 @@ change needed.
 | `watchdog_fired` repeatedly | raise `--watchdog-timeout`, and run with `--log-level DEBUG` to see which call stalls |
 | `mac_changed_using_pinned` | a new adapter appeared; set `--mac-address` explicitly or delete `<state_dir>/identity.json` |
 | `uuid_getnode_is_random` | no MAC could be detected; set `mac_address` in the config |
+| anything unexplained | run `kmitl-authen doctor` — it prints the raw portal response next to the inferred verdict |
 | `control_server_failed` | the port is taken — often an older copy of the daemon still running |
 | `long_gap_detected likely=suspend_or_clock_change` | normal after a laptop sleep; the daemon re-logs in by itself |
 | `long_gap_detected likely=stall` | something blocked the loop; check `monotonic_s` against `requested_s`, and look for a preceding `read_timeout` |
@@ -290,11 +310,49 @@ State, logs and the pinned identity live in:
 
 ---
 
+## What is verified
+
+Being straight about this, because the failure modes here are subtle.
+
+**Tested, and would fail the build if broken** — 129 tests plus CI on Linux,
+Windows and macOS across Python 3.9/3.11/3.13:
+
+- every request carries a timeout (asserted below our own session wrapper)
+- a silent portal is survived by the read timeout, with the loop continuing
+- failed logins back off; the sustained rate stays under 1 request/second
+- the watchdog fires on a stalled iteration and not on a deliberate sleep
+- all three force-relogin triggers, end to end against a live daemon
+- a long gap is detected, classified and acted on (`SIGSTOP` for 70 s)
+- bad credentials stop at the limit; scattered ones never do
+- logs stay valid UTF-8 and never leak the password, including on a cp874 console
+- clean exit 0 on `SIGTERM`, exit 2 on a bad config, exit 3 on bad credentials
+- the Docker health check, in both the healthy and unhealthy directions
+
+**Inferred, not observed** — this needs `doctor` on campus:
+
+| | |
+|---|---|
+| The login response shape | `portal._classify()` trusts only `success` and `result`. `code` and `status` are deliberately ignored, because `code: 0` means success in some portal APIs and failure in others. An unrecognised body is reported as OK and the probe decides. |
+| Whether `success` is even present | The run log shows `newauthen.py` printing "Portal rejected" 122 times on HTTP 200s, then coming online — so a 200 with falsy `success` happened on logins that worked. If that is the normal success shape, `doctor` will show `my verdict: rejected` alongside `[5] OK`, and the daemon still works because the probe outranks the body. |
+| Credential-error wording | `_CREDENTIAL_MARKERS` is a guess at the real strings. A false positive here only costs a backoff, never a stop, because the circuit breaker needs **consecutive** failures and any confirmed connectivity clears the streak. |
+| `acip` | Carried over as `10.252.13.10` from the old script. |
+
+**Not tested at all:**
+
+- The Docker image has never been built (no Docker on the development machine);
+  CI builds it. The compose file is YAML-validated and the health-check
+  one-liner was run against a live daemon.
+- `deploy/routeros/kmitl-authen.rsc` has never run on hardware. Syntax is
+  checked against MikroTik's docs — `:tolower` is not a RouterOS builtin, so
+  there is a manual hex map — but nothing more.
+- The Windows Scheduled Task scripts have not been run on Windows.
+- `requires-python = ">=3.9"` is a claim CI checks; only 3.10 was available locally.
+
 ## Development
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 117 tests, no network needed
+python3 -m pytest                 # 129 tests, no network needed
 ```
 
 Layout:

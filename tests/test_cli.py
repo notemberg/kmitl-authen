@@ -124,3 +124,14 @@ def test_missing_credentials_exits_with_the_config_code(monkeypatch, tmp_path, c
     monkeypatch.chdir(tmp_path)
     assert cli.main(["run"]) == 2
     assert "configuration error" in capsys.readouterr().err
+
+
+def test_doctor_is_a_known_subcommand():
+    args = cli.build_parser().parse_args(["doctor", "-u", "x", "-p", "y"])
+    assert args.command == "doctor"
+    assert args.no_login is False
+
+
+def test_doctor_no_login_flag():
+    args = cli.build_parser().parse_args(["doctor", "--no-login"])
+    assert args.no_login is True

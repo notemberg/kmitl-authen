@@ -56,6 +56,14 @@ def build_parser() -> argparse.ArgumentParser:
     cfg = sub.add_parser("config", help="write a config.json interactively")
     cfg.add_argument("--path", default="config.json")
 
+    probe = sub.add_parser(
+        "doctor",
+        help="one-shot check: connectivity, identity, and the portal's real response",
+    )
+    _add_run_arguments(probe)
+    probe.add_argument("--no-login", dest="no_login", action="store_true",
+                       help="probe and report only; do not attempt a login")
+
     return parser
 
 
@@ -320,10 +328,87 @@ def cmd_config(args: argparse.Namespace) -> int:
     return EXIT_OK
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    """Report exactly what this machine and the portal actually do.
+
+    Everything in this project was developed off-campus against a fake portal,
+    so the real request/response shapes are inferred rather than observed. This
+    prints them verbatim, once, so they can be checked instead of assumed.
+    """
+    from .portal import Portal, local_ip
+
+    cfg, state_dir = _load(args)
+    log = logging_setup.get_logger("doctor")
+
+    print("=" * 72)
+    print("kmitl-authen doctor")
+    print("=" * 72)
+
+    print("\n[1] identity")
+    try:
+        mac = resolve_mac(cfg.mac_address, cfg.ip_address, state_dir)
+    except ValueError as exc:
+        print(f"    MAC            : COULD NOT DETECT -- {exc}")
+        return EXIT_CONFIG
+    detected_ip = local_ip((cfg.acip, "8.8.8.8"))
+    print(f"    username       : {cfg.username}")
+    print(f"    MAC presented  : {mac}  ({'from config' if cfg.mac_address else 'detected+pinned'})")
+    print(f"    IP presented   : {cfg.ip_address or detected_ip or '(none found)'}"
+          f"{'' if cfg.ip_address else '  (auto-detected)'}")
+    print(f"    state dir      : {state_dir}")
+
+    portal = Portal(cfg, mac)
+    try:
+        print("\n[2] connectivity probes")
+        for url in cfg.probe_urls:
+            online, detail = portal.probe_one(url)
+            print(f"    {'OK  ' if online else 'FAIL'} {url}  -> {detail}")
+
+        online, detail = portal.check_internet()
+        print(f"\n    verdict: {'internet reachable' if online else 'behind the portal'}"
+              f"  ({detail})")
+
+        if args.no_login:
+            print("\n[3] login  : skipped (--no-login)")
+            return EXIT_OK
+
+        print("\n[3] login -- THIS IS THE PART THAT WAS NEVER TESTED FOR REAL")
+        result = portal.login(cfg.ip_address or detected_ip)
+        print(f"    HTTP status    : {result.status_code}")
+        print(f"    latency        : {result.latency_ms} ms")
+        print(f"    my verdict     : {result.outcome}"
+              f"{'  (FATAL - would stop the daemon)' if result.fatal else ''}")
+        print(f"    why             : {result.detail or '(no reason recorded)'}")
+        print(f"    RAW BODY        : {result.body or '(empty)'}")
+        print("\n    ^ if 'my verdict' disagrees with whether you end up online,")
+        print("      the RAW BODY line is the thing to share -- the verdict is")
+        print("      inferred from field names that were guessed, not observed.")
+
+        print("\n[4] heartbeat")
+        beat = portal.heartbeat()
+        print(f"    HTTP status    : {beat.status_code}")
+        print(f"    my verdict     : {beat.outcome}")
+        print(f"    RAW BODY        : {beat.body or '(empty)'}")
+
+        print("\n[5] connectivity after login")
+        online, detail = portal.check_internet()
+        print(f"    {'OK  ' if online else 'FAIL'} {detail}")
+        print("\n" + "=" * 72)
+        if online:
+            print("Result: online. The daemon will work.")
+        else:
+            print("Result: NOT online. Share sections [3] and [4] above.")
+        print("=" * 72)
+        return EXIT_OK if online else 1
+    finally:
+        portal.close()
+        log.debug("doctor_finished")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    known = {"run", "relogin", "status", "logout", "config"}
+    known = {"run", "relogin", "status", "logout", "config", "doctor"}
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
         argv.insert(0, "run")          # `kmitl-authen -u x -p y` keeps working
     elif argv[0] not in known and not argv[0].startswith("-"):
@@ -336,6 +421,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": cmd_status,
         "logout": cmd_logout,
         "config": cmd_config,
+        "doctor": cmd_doctor,
     }
     handler = handlers.get(args.command or "run")
     if handler is None:  # pragma: no cover

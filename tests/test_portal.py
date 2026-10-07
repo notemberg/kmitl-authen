@@ -214,3 +214,51 @@ def test_local_ip_falls_through_to_the_next_target(monkeypatch):
     monkeypatch.setattr(socket_module, "socket", FakeSocket)
     assert local_ip(("10.252.13.10", "8.8.8.8")) == "192.168.1.50"
     assert attempted == ["10.252.13.10", "8.8.8.8"]
+
+
+@pytest.mark.parametrize("body", [
+    '{"code": 0, "msg": "ok"}',
+    '{"status": 0}',
+    '{"code": "0000"}',
+])
+def test_ambiguous_numeric_verdict_fields_are_not_guessed(portal, monkeypatch, body):
+    """`code: 0` means success in most portal APIs and failure in others.
+
+    Guessing wrong would mislabel every login, so these are not consulted at
+    all; the connectivity probe decides and the body is only logged.
+    """
+    _stub(portal, monkeypatch, FakeResponse(200, body))
+    result = portal.login("10.0.0.1")
+    assert result.outcome == Outcome.OK
+    assert not result.fatal
+
+
+def test_explicit_success_false_is_still_honoured(portal, monkeypatch):
+    _stub(portal, monkeypatch, FakeResponse(200, '{"success": false}'))
+    result = portal.login("10.0.0.1")
+    assert result.outcome == Outcome.REJECTED
+    assert not result.fatal, "a plain rejection must not stop the daemon"
+
+
+def test_login_body_is_preserved_in_the_detail_for_diagnosis(portal, monkeypatch):
+    """Without campus access the real body shape is unknown; log it verbatim."""
+    body = '{"weird": "shape", "gate": "opened"}'
+    _stub(portal, monkeypatch, FakeResponse(200, body))
+    result = portal.login("10.0.0.1")
+    assert "weird" in result.detail
+
+
+def test_raw_body_is_always_kept_even_when_a_verdict_is_inferred(portal, monkeypatch):
+    """`doctor` must show what the portal said, not what we concluded."""
+    body = '{"success": false, "gw": "opened", "ticket": "xyz"}'
+    _stub(portal, monkeypatch, FakeResponse(200, body))
+    result = portal.login("10.0.0.1")
+    assert result.detail == "success=false"       # our inference
+    assert result.body == body                    # what actually came back
+
+
+def test_probe_one_restores_the_config(portal, monkeypatch):
+    original = list(portal.cfg.probe_urls)
+    _stub(portal, monkeypatch, FakeResponse(204, ""))
+    assert portal.probe_one("http://only-this/")[0] is True
+    assert portal.cfg.probe_urls == original

@@ -115,6 +115,12 @@ class Daemon:
         self.last_detail = ""
         self.last_gap_seconds = 0.0
         self.login_attempts_since_success = 0
+        # Consecutive, not lifetime. Three credential-looking rejections spread
+        # across a long run -- each followed by a successful reconnect -- must
+        # not add up to "the password is wrong, stop the daemon". That matters
+        # because the portal's own verdict field is not fully known, so a
+        # misread body has to be survivable.
+        self.consecutive_credential_failures = 0
         self.watchdog_resets = read_reset_count(state_dir)
         controller.set_status_provider(self.status)
 
@@ -151,6 +157,7 @@ class Daemon:
             "logins_total": self.counters.logins_total,
             "login_failures_total": self.counters.login_failures_total,
             "credential_failures_total": self.counters.credential_failures_total,
+            "consecutive_credential_failures": self.consecutive_credential_failures,
             "heartbeats_total": self.counters.heartbeats_total,
             "heartbeat_failures_total": self.counters.heartbeat_failures_total,
             "network_errors_total": self.counters.network_errors_total,
@@ -218,6 +225,7 @@ class Daemon:
         if result.ok:
             self.counters.logins_total += 1
             self.login_attempts_since_success = 0
+            self.consecutive_credential_failures = 0
             log.info("login_ok", extra=fields)
             return result
 
@@ -228,6 +236,8 @@ class Daemon:
             log.warning("login_network_error", extra=fields)
         elif result.outcome == Outcome.BAD_CREDENTIALS:
             self.counters.credential_failures_total += 1
+            self.consecutive_credential_failures += 1
+            fields["consecutive"] = self.consecutive_credential_failures
             log.error("login_bad_credentials", extra=fields)
         else:
             log.warning("login_rejected", extra=fields)
@@ -257,7 +267,7 @@ class Daemon:
 
     def _credentials_exhausted(self) -> bool:
         limit = self.cfg.max_credential_failures
-        return bool(limit) and self.counters.credential_failures_total >= limit
+        return bool(limit) and self.consecutive_credential_failures >= limit
 
     def _attempts_exhausted(self) -> bool:
         limit = self.cfg.max_login_attempts
@@ -387,6 +397,14 @@ class Daemon:
             self._set_state(State.ONLINE, detail=detail)
             self._reset_backoff()
             self.last_success = time.monotonic()
+            # The probe outranks the portal's self-report: if we have working
+            # internet, the credentials cannot be wrong, whatever a body said.
+            if self.consecutive_credential_failures:
+                log.info(
+                    "credential_streak_cleared_by_connectivity",
+                    extra={"was": self.consecutive_credential_failures},
+                )
+                self.consecutive_credential_failures = 0
             if first_time:
                 log.info(
                     "online",
@@ -430,7 +448,7 @@ class Daemon:
                 log.critical(
                     "credentials_rejected_giving_up",
                     extra={
-                        "failures": self.counters.credential_failures_total,
+                        "consecutive_failures": self.consecutive_credential_failures,
                         "hint": "fix username/password, then restart",
                     },
                 )
@@ -439,11 +457,11 @@ class Daemon:
             log.error(
                 "credentials_rejected_cooldown",
                 extra={
-                    "failures": self.counters.credential_failures_total,
+                    "consecutive_failures": self.consecutive_credential_failures,
                     "cooldown_s": CREDENTIAL_COOLDOWN,
                 },
             )
-            self.counters.credential_failures_total = 0
+            self.consecutive_credential_failures = 0
             return CREDENTIAL_COOLDOWN, next_heartbeat
 
         if self._attempts_exhausted():
@@ -461,4 +479,8 @@ class Daemon:
         result = self._do_login(detail or "offline")
         if result.ok:
             return POST_LOGIN_RECHECK, time.monotonic() + self.cfg.heartbeat_interval
+        # _do_login left us in LOGGING_IN; we are about to sleep, so say so.
+        # /status claiming "logging_in" through a two-minute backoff is exactly
+        # the kind of lie this rewrite exists to remove.
+        self._set_state(State.BACKOFF, detail=result.detail or result.outcome)
         return self._bump_backoff(), next_heartbeat
