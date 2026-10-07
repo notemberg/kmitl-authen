@@ -26,7 +26,7 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 140 |
+| Tests | none | 143 |
 
 ---
 
@@ -318,7 +318,7 @@ State, logs and the pinned identity live in:
 
 Being straight about this, because the failure modes here are subtle.
 
-**Tested, and would fail the build if broken** — 140 tests plus CI on Linux,
+**Tested, and would fail the build if broken** — 143 tests plus CI on Linux,
 Windows and macOS across Python 3.9/3.11/3.13:
 
 - every request carries a timeout (asserted below our own session wrapper)
@@ -347,11 +347,22 @@ heartbeat answers HTTP 200 with an empty body. MAC detection and pinning work
 on Windows, and the box-drawing banner renders in PowerShell without the
 `UnicodeEncodeError` that killed the old script.
 
+Two logins minutes apart returned **different** `token` and `psessionid`
+values, both with `success: true`, so a re-login mints a fresh session instead
+of erroring on the existing one. Re-authenticating while already online is
+safe, and the 8-hour `relogin_interval` refreshes rather than collides.
+
+The portal's **logout does not de-authenticate the machine**: it answers
+`success: true` with the session fields stripped, but traffic still flows 30
+seconds later. Portal session and gateway authorisation appear to be separate.
+A logout-on-exit would therefore free nothing, which is why this daemon does
+not do one.
+
 **Still not observed:**
 
 | | |
 |---|---|
-| Logging in from a **de-authenticated** state | The campus run was already authenticated, so the login was exercised from an already-online state. Run `kmitl-authen doctor --full-cycle`: it logs out, confirms the portal blocks you, then logs back in. |
+| Logging in from a **de-authenticated** state | Cannot be reached on demand: the portal's logout answers `success: true` but the gateway keeps letting traffic through, so `--full-cycle` comes back INCONCLUSIVE (exit 2) rather than faking a pass. Disconnect and reconnect to the network to force it, or just run the daemon — the log records the recovery the first time the portal drops you (`internet_unavailable` → `login_ok` → `heartbeat_ok`). |
 | Credential-error wording | `_CREDENTIAL_MARKERS` is a guess at the real strings. A false positive only costs a backoff, never a stop: the circuit breaker needs **consecutive** failures and any confirmed connectivity clears the streak. |
 | `acip` | Carried over as `10.252.13.10` from the old script. |
 | `netSwitchStatus`, `isEscape`, `tempPassEnable` | Present in the response, meaning unknown, ignored. |
@@ -371,7 +382,7 @@ on Windows, and the box-drawing banner renders in PowerShell without the
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 140 tests, no network needed
+python3 -m pytest                 # 143 tests, no network needed
 ```
 
 Layout:

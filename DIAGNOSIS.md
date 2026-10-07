@@ -433,17 +433,71 @@ The token is now held on the `Portal` instance and attached per request by
 `_portal_headers()`, to portal calls only. Asserted by
 `test_heartbeat_does_not_carry_the_portal_token`.
 
-### What the campus run did NOT test
+### Re-login is safe, and mints a fresh session every time
 
-The machine was already authenticated by the old script, so every probe in
-section [2] passed *before* the login in section [3]. The login was therefore
-exercised from an already-online state, which tells us the portal is happy to
-re-authenticate an active session — useful, but not the path that matters.
+Two campus logins, minutes apart, both from an already-authenticated state:
 
-**Logging in from a de-authenticated state is still untested.**
-`doctor --full-cycle` is for exactly this: it logs out, confirms the portal has
-started blocking, then logs back in and confirms recovery. A plain `doctor` run
-now says so in its verdict instead of reporting a clean pass.
+| | token | psessionid |
+|---|---|---|
+| 16:53 | `db91cb19…a372c1c` | `7df7b9da…1dd88e` |
+| 17:50 | `1349e13d…d122915e` | `f0535762…48673db` |
+
+Both answered `success: true`, with a **different** token and psessionid each
+time. So each login mints a new session rather than erroring on an existing
+one. Three consequences:
+
+- The "it will just tell me I'm already authenticated" worry is a non-issue.
+  The portal does not treat a re-login as a conflict.
+- The proactive `relogin_interval` (8 h) is sound — it refreshes rather than
+  colliding.
+- Recovering from a confused state by simply logging in again is valid, which
+  is what `_do_login` relies on.
+
+### The portal's logout does not de-authenticate the machine
+
+`doctor --full-cycle` found this. The logout answers HTTP 200 with:
+
+```json
+{"isEscape": false, "data": {}, "enableAutoVerify": false,
+ "success": true, "tempPassEnable": false, "netSwitchStatus": 0}
+```
+
+`success: true`, and note what is **missing**: no `token`, no `psessionid`. So
+the portal did close its side of the session. But connectivity continued, with
+all three probes still passing 30 seconds later on freshly opened sockets.
+
+The likely reading is that the portal session and the gateway's authorisation
+are separate: `acip` (10.252.13.10) keeps letting the (IP, MAC) pair through
+until its own timeout, whatever the portal records. The alternative — that
+logout needs something this client does not send — cannot be ruled out, but
+`success: true` with the session fields stripped argues against it.
+
+What follows from it:
+
+- **Logging in from a de-authenticated state remains untested.** It cannot be
+  reached on demand from this machine. Disconnecting and reconnecting to the
+  network is the manual route; otherwise the daemon's own log will record the
+  recovery the first time the portal drops the session by itself
+  (`internet_unavailable` → `login_ok` → `heartbeat_ok`).
+- A logout-on-exit, which `newauthen.py` added, does not actually free
+  anything. This daemon does not log out on exit, which turns out to be the
+  right call for a reason I had not anticipated.
+
+### A bug in the test itself
+
+The first `--full-cycle` printed "Result: logged out, confirmed blocked, logged
+back in, online. That is the full cycle. The daemon will work." — two sections
+after reporting `now offline? : NO - logout did not take effect`.
+
+The verdict only read the final `online` flag and `args.full_cycle`; it never
+recorded whether the de-authentication actually happened. A tool whose entire
+purpose is to remove false reassurance was manufacturing it.
+
+Now tracked as a three-state `deauth_confirmed` (not attempted / confirmed /
+failed), the wait polls for 30 s instead of deciding after 2, section [4] is
+relabelled "still authenticated — NOT the path we wanted to test" when
+appropriate, and an inconclusive run exits **2** rather than 0 so a script can
+tell. Asserted by `test_full_cycle_failed_deauth_is_inconclusive_not_a_pass`.
 
 ---
 
@@ -467,3 +521,4 @@ now says so in its verdict instead of reporting a clean pass.
 | 14 | *(introduced here)* the portal token sent to the heartbeat host | held per-instance, attached per request to portal calls only |
 | 15 | *(introduced here)* `doctor` printed the response body twice | `detail` carries the reason, `body` carries the body |
 | 16 | *(introduced here)* `config` exited silently on Ctrl+C, looking like a crash | explicit "Cancelled", username validation, `getpass` fallback |
+| 17 | *(introduced here)* `doctor --full-cycle` reported a pass for a cycle that failed | three-state `deauth_confirmed`, 30 s poll, exit 2 when inconclusive |

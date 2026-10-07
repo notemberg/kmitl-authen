@@ -22,6 +22,10 @@ from .watchdog import Watchdog
 
 PROG = "kmitl-authen"
 
+# How long `doctor --full-cycle` waits for a logout to actually take effect.
+# The gateway can hold its authorisation after the portal drops the session.
+DEAUTH_POLL_SECONDS = 30.0
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -409,9 +413,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print("\n[3] login  : skipped (--no-login)")
             return EXIT_OK
 
+        # None = not attempted, True = the portal really did start blocking us,
+        # False = it accepted the logout but traffic still flows. The final
+        # verdict has to read this; reporting a passed cycle that never
+        # happened is the exact kind of false reassurance this tool exists to
+        # remove.
+        deauth_confirmed: bool | None = None
+
         if args.full_cycle:
             if not online:
                 print("\n[3] logout : skipped, already behind the portal")
+                deauth_confirmed = True
             else:
                 print("\n[3] logout -- getting to a known de-authenticated state")
                 # Log in first so the session holds the portal's token; a fresh
@@ -421,19 +433,43 @@ def cmd_doctor(args: argparse.Namespace) -> int:
                 bye = portal.logout()
                 print(f"    logout         : {bye.outcome} (HTTP {bye.status_code})")
                 print(f"    RAW BODY       : {bye.body or '(empty)'}")
-                portal.reset_connections("doctor_full_cycle")
-                time.sleep(2)
-                online, detail = portal.check_internet()
-                print(f"    now offline?   : "
-                      f"{'YES - good, the portal is blocking us' if not online else 'NO - logout did not take effect'}"
-                      f"  ({detail})")
-                if online:
-                    print("\n    Cannot test the de-authenticated path: the portal still")
-                    print("    lets traffic through after a logout. Disconnect from the")
-                    print("    network and reconnect, then run this again.")
 
-        label = ("[4] login FROM A DE-AUTHENTICATED STATE" if args.full_cycle
-                 else "[3] login (from the state the machine is already in)")
+                # The gateway may hold its authorisation for a while after the
+                # portal has dropped the session, so poll rather than deciding
+                # after one 2-second look.
+                deadline = time.monotonic() + DEAUTH_POLL_SECONDS
+                attempt = 0
+                while True:
+                    portal.reset_connections("doctor_full_cycle")
+                    online, detail = portal.check_internet()
+                    attempt += 1
+                    if not online:
+                        print(f"    now offline?   : YES after {attempt * 3}s"
+                              f"  ({detail})")
+                        deauth_confirmed = True
+                        break
+                    if time.monotonic() >= deadline:
+                        print(f"    now offline?   : NO, still online after "
+                              f"{DEAUTH_POLL_SECONDS}s  ({detail})")
+                        deauth_confirmed = False
+                        break
+                    print(f"    still online, retrying ({attempt * 3}s)...")
+                    time.sleep(3)
+
+                if deauth_confirmed is False:
+                    print("\n    The portal answered the logout with success=true but kept")
+                    print("    letting traffic through. Either its logout only clears the")
+                    print("    portal-side session while the gateway keeps its own entry")
+                    print("    until a timeout, or logout needs something this client is")
+                    print("    not sending. Either way the next section cannot test the")
+                    print("    de-authenticated path -- see the verdict at the end.")
+
+        if args.full_cycle and deauth_confirmed:
+            label = "[4] login FROM A CONFIRMED DE-AUTHENTICATED STATE"
+        elif args.full_cycle:
+            label = "[4] login (still authenticated -- NOT the path we wanted to test)"
+        else:
+            label = "[3] login (from the state the machine is already in)"
         print(f"\n{label}")
         result = portal.login(cfg.ip_address or detected_ip)
         print(f"    HTTP status    : {result.status_code}")
@@ -457,17 +493,34 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"    {'OK  ' if online else 'FAIL'} {detail}")
 
         print("\n" + "=" * 72)
-        if online and args.full_cycle:
-            print("Result: logged out, confirmed blocked, logged back in, online.")
-            print("That is the full cycle. The daemon will work.")
-        elif online:
+        if not online:
+            print("Result: NOT online after a login. Share the RAW BODY lines above.")
+            print("=" * 72)
+            return 1
+
+        if deauth_confirmed is True:
+            print("Result: PASS. Logged out, confirmed the portal started blocking,")
+            print("logged back in, online again. That is the whole cycle.")
+        elif deauth_confirmed is False:
+            print("Result: INCONCLUSIVE. Login and heartbeat both work, but the logout")
+            print("did not de-authenticate this machine, so logging in from a blocked")
+            print("state is still untested.")
+            print("")
+            print("Two ways to cover it:")
+            print("  1. Disconnect from the campus network, reconnect, and run this")
+            print("     again -- reconnecting usually lands you behind the portal.")
+            print("  2. Just run the daemon and let it prove itself. When the portal")
+            print("     drops you on its own, the log records the recovery:")
+            print("       internet_unavailable  ->  login_ok  ->  heartbeat_ok")
+            print("     Search the log for 'internet_unavailable' after a day.")
+        else:
             print("Result: online -- but you were ALREADY online before [3], so this")
             print("did not test logging in from a de-authenticated state, which is")
             print("the path that actually matters. Run: kmitl-authen doctor --full-cycle")
-        else:
-            print("Result: NOT online. Share the RAW BODY lines above.")
         print("=" * 72)
-        return EXIT_OK if online else 1
+        # Exit 0 only for a real pass or a plain run; an inconclusive cycle is
+        # not a success, and a script should be able to tell.
+        return EXIT_OK if deauth_confirmed is not False else 2
     finally:
         portal.close()
         log.debug("doctor_finished")

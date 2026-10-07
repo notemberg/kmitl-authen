@@ -185,3 +185,87 @@ def test_password_prompt_falls_back_when_getpass_fails(monkeypatch, capsys):
     monkeypatch.setattr("builtins.input", lambda _="": "typed-visibly")
     assert cli._prompt_password() == "typed-visibly"
     assert "cannot hide input" in capsys.readouterr().out
+
+
+# --- doctor --full-cycle verdicts -----------------------------------------
+# Regression: the first version printed "That is the full cycle" even when the
+# logout had plainly failed two sections earlier. A tool whose job is to remove
+# false reassurance must not manufacture it.
+
+class _FakePortal:
+    """Portal stub for doctor. `deauth_works` drives the logout behaviour."""
+
+    def __init__(self, cfg, mac, deauth_works=True, online=True):
+        from kmitl_authen.portal import Outcome, Result
+        self.cfg = cfg
+        self.online = online
+        self.deauth_works = deauth_works
+        self._Result = Result
+        self._Outcome = Outcome
+
+    def check_internet(self):
+        return (True, "probe ok") if self.online else (False, "captive portal response")
+
+    def probe_one(self, url):
+        return self.check_internet()
+
+    def login(self, ip):
+        self.online = True
+        return self._Result(self._Outcome.OK, "success=true", 200, 12,
+                            body='{"success": true}')
+
+    def logout(self):
+        if self.deauth_works:
+            self.online = False
+        return self._Result(self._Outcome.OK, "", 200, 10, body='{"success": true}')
+
+    def heartbeat(self):
+        return self._Result(self._Outcome.OK, "", 200, 20, body="")
+
+    def reset_connections(self, reason=""):
+        pass
+
+    def close(self):
+        pass
+
+
+def _run_doctor(monkeypatch, tmp_path, deauth_works, extra=()):
+    from kmitl_authen import portal as portal_module
+    monkeypatch.setattr(
+        portal_module, "Portal",
+        lambda cfg, mac: _FakePortal(cfg, mac, deauth_works=deauth_works))
+    monkeypatch.setattr(portal_module, "local_ip", lambda *a, **k: "10.0.0.1")
+    monkeypatch.setattr(cli, "DEAUTH_POLL_SECONDS", 0.0)
+    monkeypatch.setattr(cli.time, "sleep", lambda s: None)
+    args = cli.build_parser().parse_args([
+        "doctor", "-u", "u", "-p", "p", "--mac-address", "aabbccddeeff",
+        "--state-dir", str(tmp_path), "--log-level", "CRITICAL", *extra])
+    return cli.cmd_doctor(args)
+
+
+def test_full_cycle_failed_deauth_is_inconclusive_not_a_pass(monkeypatch, tmp_path, capsys):
+    code = _run_doctor(monkeypatch, tmp_path, deauth_works=False, extra=["--full-cycle"])
+    out = capsys.readouterr().out
+    assert "INCONCLUSIVE" in out
+    assert "PASS" not in out
+    assert "That is the whole cycle" not in out
+    assert "NOT the path we wanted to test" in out
+    assert code == 2, "an inconclusive cycle must not exit 0"
+
+
+def test_full_cycle_real_deauth_passes(monkeypatch, tmp_path, capsys):
+    code = _run_doctor(monkeypatch, tmp_path, deauth_works=True, extra=["--full-cycle"])
+    out = capsys.readouterr().out
+    assert "PASS" in out
+    assert "CONFIRMED DE-AUTHENTICATED" in out
+    assert "INCONCLUSIVE" not in out
+    assert code == 0
+
+
+def test_plain_doctor_says_what_it_did_not_test(monkeypatch, tmp_path, capsys):
+    code = _run_doctor(monkeypatch, tmp_path, deauth_works=True)
+    out = capsys.readouterr().out
+    assert "ALREADY online" in out
+    assert "--full-cycle" in out
+    assert "PASS" not in out
+    assert code == 0
