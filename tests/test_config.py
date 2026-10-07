@@ -338,3 +338,113 @@ def test_dpapi_failure_names_the_account_problem(monkeypatch):
         cfgmod.unprotect("dpapi:" + base64.b64encode(b"blob").decode())
     with pytest.raises(ConfigError, match="dpapi-machine"):
         cfgmod.unprotect("dpapi:" + base64.b64encode(b"blob").decode())
+
+
+# --- the credential store must never be able to hang us -------------------
+# Measured on a headless Linux box: keyring.set_password() never returned.
+# The daemon calls unprotect() at startup, so an unbounded call there would
+# hang it at boot.
+
+def _hangs_forever(*args, **kwargs):
+    import threading
+    threading.Event().wait()        # never set
+
+
+def test_keyring_write_cannot_hang_forever(monkeypatch):
+    class Hanging:
+        set_password = staticmethod(_hangs_forever)
+
+    monkeypatch.setattr(cfgmod, "_keyring_module", lambda: Hanging)
+    monkeypatch.setattr(cfgmod, "KEYRING_TIMEOUT", 0.3)
+    import time
+    started = time.monotonic()
+    with pytest.raises(ConfigError, match="did not answer within"):
+        cfgmod.protect("hunter2", "keyring", account="u")
+    assert time.monotonic() - started < 5, "the call was not actually bounded"
+
+
+def test_keyring_read_cannot_hang_the_daemon_at_startup(monkeypatch):
+    class Hanging:
+        get_password = staticmethod(_hangs_forever)
+
+    monkeypatch.setattr(cfgmod, "_keyring_module", lambda: Hanging)
+    monkeypatch.setattr(cfgmod, "KEYRING_TIMEOUT", 0.3)
+    import time
+    started = time.monotonic()
+    with pytest.raises(ConfigError, match="did not answer within"):
+        cfgmod.unprotect("keyring:66011374")
+    assert time.monotonic() - started < 5
+
+
+def test_keyring_timeout_names_a_working_alternative(monkeypatch):
+    class Hanging:
+        get_password = staticmethod(_hangs_forever)
+
+    monkeypatch.setattr(cfgmod, "_keyring_module", lambda: Hanging)
+    monkeypatch.setattr(cfgmod, "KEYRING_TIMEOUT", 0.2)
+    with pytest.raises(ConfigError) as caught:
+        cfgmod.unprotect("keyring:u")
+    message = str(caught.value)
+    assert "--scheme b64" in message
+    assert "KMITL_PASSWORD" in message
+
+
+def test_best_scheme_rejects_a_keyring_that_only_claims_to_work(monkeypatch):
+    """Backend priority is not evidence; a chainer advertises 10 then blocks."""
+    class Claims:
+        priority = 10
+        set_password = staticmethod(_hangs_forever)
+        get_password = staticmethod(_hangs_forever)
+
+    class Mod:
+        @staticmethod
+        def get_keyring():
+            return Claims()
+
+    monkeypatch.setattr(cfgmod, "_is_windows", lambda: False)
+    monkeypatch.setattr(cfgmod, "_keyring_module", lambda: Mod)
+    monkeypatch.setattr(cfgmod, "KEYRING_PROBE_TIMEOUT", 0.2)
+    assert cfgmod.best_scheme() == "b64"
+
+
+def test_best_scheme_accepts_a_keyring_that_round_trips(monkeypatch):
+    store = {}
+
+    class Working:
+        priority = 10
+
+        @staticmethod
+        def set_password(service, account, secret):
+            store[(service, account)] = secret
+
+        @staticmethod
+        def get_password(service, account):
+            return store.get((service, account))
+
+        @staticmethod
+        def delete_password(service, account):
+            store.pop((service, account), None)
+
+    class Mod:
+        @staticmethod
+        def get_keyring():
+            return Working()
+
+    monkeypatch.setattr(cfgmod, "_is_windows", lambda: False)
+    monkeypatch.setattr(cfgmod, "_keyring_module", lambda: Mod)
+    assert cfgmod.best_scheme() == "keyring"
+    assert store == {}, "the probe must clean up after itself"
+
+
+def test_a_zero_priority_backend_is_not_used(monkeypatch):
+    class Null:
+        priority = 0
+
+    class Mod:
+        @staticmethod
+        def get_keyring():
+            return Null()
+
+    monkeypatch.setattr(cfgmod, "_is_windows", lambda: False)
+    monkeypatch.setattr(cfgmod, "_keyring_module", lambda: Mod)
+    assert cfgmod.best_scheme() == "b64"

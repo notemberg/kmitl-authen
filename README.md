@@ -26,7 +26,7 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 166 |
+| Tests | none | 178 |
 
 ---
 
@@ -329,7 +329,7 @@ change needed.
 | `login_bad_credentials` | the username has no `@kmitl.ac.th`; try the password in a browser at the portal |
 | `all probes unreachable` | DNS is dead or every probe host is blocked; try `--probe-urls http://<something-reachable>/` |
 | `login_rejected` with an HTML body | the portal moved; check `login_url` |
-| `watchdog_fired` repeatedly | raise `--watchdog-timeout`, and run with `--log-level DEBUG` to see which call stalls |
+| `watchdog_fired` repeatedly | Read the `grace_s` and `last_activity` fields, and the `watchdog-stall-*.txt` report next to the log — it holds every thread's stack at the moment it fired. `grace_s=0` with `last_activity` naming a request (`heartbeat`/`probe`/`login`) means the sleep that should have followed never ran; `last_activity=idle:NNNs` means a real stall during a deliberate sleep. To keep working meanwhile: `--watchdog-timeout 0` disables it. |
 | `mac_changed_using_pinned` | a new adapter appeared; set `--mac-address` explicitly or delete `<state_dir>/identity.json` |
 | `uuid_getnode_is_random` | no MAC could be detected; set `mac_address` in the config |
 | anything unexplained | run `kmitl-authen doctor` — it prints the raw portal response next to the inferred verdict |
@@ -357,7 +357,7 @@ State, logs and the pinned identity live in:
 
 Being straight about this, because the failure modes here are subtle.
 
-**Tested, and would fail the build if broken** — 166 tests plus CI on Linux,
+**Tested, and would fail the build if broken** — 178 tests plus CI on Linux,
 Windows and macOS across Python 3.9/3.11/3.13:
 
 - every request carries a timeout (asserted below our own session wrapper)
@@ -421,7 +421,7 @@ not do one.
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 166 tests, no network needed
+python3 -m pytest                 # 178 tests, no network needed
 ```
 
 Layout:

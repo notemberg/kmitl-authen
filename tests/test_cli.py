@@ -156,7 +156,10 @@ def test_config_rejects_an_ip_typed_as_a_username(tmp_path, monkeypatch, capsys)
     answers = iter(["161.246.5.19", "", "", "", ""])
     monkeypatch.setattr("builtins.input", lambda _="": next(answers))
     monkeypatch.setattr(cli, "_prompt_password", lambda: "secret")
-    args = cli.build_parser().parse_args(["config", "--path", str(target)])
+    # Never touch the real credential store from a test: on a headless box
+    # keyring blocks forever, which is what hung this suite.
+    args = cli.build_parser().parse_args(
+        ["config", "--path", str(target), "--scheme", "b64"])
     assert cli.cmd_config(args) == 2
     assert "looks like an IP address" in capsys.readouterr().out
     assert not target.exists()
@@ -167,7 +170,10 @@ def test_config_strips_an_email_domain(tmp_path, monkeypatch):
     answers = iter(["66011374@kmitl.ac.th", "", "", "", ""])
     monkeypatch.setattr("builtins.input", lambda _="": next(answers))
     monkeypatch.setattr(cli, "_prompt_password", lambda: "secret")
-    args = cli.build_parser().parse_args(["config", "--path", str(target)])
+    # Never touch the real credential store from a test: on a headless box
+    # keyring blocks forever, which is what hung this suite.
+    args = cli.build_parser().parse_args(
+        ["config", "--path", str(target), "--scheme", "b64"])
     assert cli.cmd_config(args) == 0
     assert json.loads(target.read_text())["username"] == "66011374"
 

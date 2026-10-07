@@ -13,8 +13,11 @@ supervisor (systemd / Docker / Task Scheduler) restarts a clean process.
 from __future__ import annotations
 
 import os
+import platform
+import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from . import EXIT_WATCHDOG
@@ -63,20 +66,50 @@ class Watchdog:
 
     def _run(self) -> None:
         poll = max(1.0, min(5.0, self.timeout / 10))
+        warned = False
         while not self._stop.wait(poll):
             with self._lock:
                 stalled = time.monotonic() - self._last_pet
                 activity = self._activity
-                allowed = self.timeout + self._grace
+                grace = self._grace
+                allowed = self.timeout + grace
+
+            if stalled <= allowed / 2:
+                warned = False
+            elif stalled <= allowed:
+                # Half way to death: say so while the process is still alive,
+                # so the log shows the state leading up to a stall instead of
+                # only the obituary.
+                if not warned:
+                    warned = True
+                    log.warning(
+                        "watchdog_half_way",
+                        extra={
+                            "stalled_s": round(stalled, 1),
+                            "allowed_s": round(allowed, 1),
+                            "grace_s": round(grace, 1),
+                            "last_activity": activity,
+                            "where": _innermost_frame(),
+                        },
+                    )
+                continue
+            else:
+                pass
+
             if stalled <= allowed:
                 continue
+
+            dump = self._write_stall_report(stalled, allowed, grace, activity)
             log.critical(
                 "watchdog_fired",
                 extra={
                     "stalled_s": round(stalled, 1),
                     "allowed_s": round(allowed, 1),
+                    "grace_s": round(grace, 1),
                     "timeout_s": self.timeout,
                     "last_activity": activity,
+                    "where": _innermost_frame(),
+                    "stack_dump": str(dump) if dump else "(could not write)",
                     "action": f"exit({EXIT_WATCHDOG}) for supervisor restart",
                 },
             )
@@ -87,6 +120,42 @@ class Watchdog:
                 except Exception:
                     pass
             os._exit(EXIT_WATCHDOG)
+
+    def _write_stall_report(
+        self, stalled: float, allowed: float, grace: float, activity: str
+    ) -> Path | None:
+        """Dump every thread's stack next to the log, so the cause is knowable.
+
+        A watchdog that only says "something stalled" is half a tool. This says
+        which thread was where. Written before ``os._exit``, so it has to be
+        cheap and must never raise.
+        """
+        if self.state_dir is None:
+            return None
+        path = self.state_dir / f"watchdog-stall-{time.strftime('%Y%m%d-%H%M%S')}.txt"
+        lines = [
+            "kmitl-authen watchdog stall report",
+            f"written            : {time.asctime()}",
+            f"platform           : {platform.system()} {platform.release()}",
+            f"python             : {platform.python_version()}",
+            f"seconds since pet  : {stalled:.1f}",
+            f"allowed            : {allowed:.1f}  (timeout {self.timeout:.1f} + grace {grace:.1f})",
+            f"last activity      : {activity}",
+            "",
+            "If 'last activity' names a deliberate sleep (idle:NNNs) then the",
+            "grace was applied and something really did stall. If it names a",
+            "request (probe/heartbeat/login) while the grace reads 0, the sleep",
+            "that should have followed it never ran - the stacks below say why.",
+            "",
+            "=" * 70,
+        ]
+        for label, stack in _thread_frames():
+            lines += [f"--- thread: {label}", stack.rstrip(), ""]
+        try:
+            path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        except OSError:
+            return None
+        return path
 
     def _record(self) -> None:
         """Bump a persisted counter so restarts are visible in /status.
@@ -109,6 +178,41 @@ class Watchdog:
             os.replace(tmp, path)
         except OSError:
             pass
+
+
+def _thread_frames() -> list[tuple[str, str]]:
+    """Every live thread with its current stack. Stdlib only, no faulthandler."""
+    names = {t.ident: t.name for t in threading.enumerate()}
+    out: list[tuple[str, str]] = []
+    try:
+        frames = sys._current_frames()
+    except Exception:  # pragma: no cover - not available on exotic builds
+        return out
+    for ident, frame in frames.items():
+        label = f"{names.get(ident, 'unknown')} (id={ident})"
+        try:
+            stack = "".join(traceback.format_stack(frame))
+        except Exception:  # pragma: no cover
+            stack = "<could not format>"
+        out.append((label, stack))
+    return out
+
+
+def _innermost_frame() -> str:
+    """One line saying where the main thread actually is, for the log record."""
+    names = {t.name: t.ident for t in threading.enumerate()}
+    target = names.get("MainThread")
+    try:
+        frame = sys._current_frames().get(target)
+    except Exception:  # pragma: no cover
+        frame = None
+    if frame is None:
+        return "unknown"
+    try:
+        summary = traceback.extract_stack(frame)[-1]
+        return f"{Path(summary.filename).name}:{summary.lineno} in {summary.name}"
+    except Exception:  # pragma: no cover
+        return "unknown"
 
 
 def read_reset_count(state_dir: Path) -> int:

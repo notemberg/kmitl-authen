@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
 from dataclasses import dataclass, field, fields
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,11 @@ _DPAPI_LOCAL_MACHINE = 0x4
 _DPAPI_UI_FORBIDDEN = 0x1
 _KEYRING_SERVICE = "kmitl-authen"
 
+# Every credential-store call is bounded. Measured on a headless Linux box:
+# keyring.set_password() never returned at all.
+KEYRING_TIMEOUT = 5.0
+KEYRING_PROBE_TIMEOUT = 3.0
+
 
 def _dpapi(encrypt: bool, data: bytes, machine_scope: bool) -> bytes:
     """Call CryptProtectData / CryptUnprotectData. Windows only."""
@@ -124,20 +130,83 @@ def _keyring_module():
     return keyring
 
 
+def _keyring_call(label: str, fn, *args, timeout: float | None = None):
+    """Run a keyring call with a hard timeout.
+
+    The Secret Service is reached over D-Bus and blocks indefinitely on a
+    headless box, a locked session, or one with no agent running -- measured,
+    not theorised. The daemon calls ``unprotect()`` at startup, so an unbounded
+    call here would hang it at boot: the exact failure this project exists to
+    remove. A daemon thread plus a join timeout is the only way to bound a
+    call that offers no timeout of its own.
+    """
+    # Read the module global at call time, not as a default argument: a
+    # default is bound when the function is defined, so the timeout could not
+    # be changed afterwards -- by a test or by anyone else.
+    if timeout is None:
+        timeout = KEYRING_TIMEOUT
+
+    done: list[Any] = []
+    failed: list[BaseException] = []
+
+    def worker() -> None:
+        try:
+            done.append(fn(*args))
+        except BaseException as exc:  # noqa: BLE001 - reported, not swallowed
+            failed.append(exc)
+
+    thread = threading.Thread(target=worker, daemon=True, name=f"keyring-{label}")
+    thread.start()
+    thread.join(timeout)
+    if thread.is_alive():
+        raise ConfigError(
+            f"the OS credential store did not answer within {timeout:g}s "
+            f"({label}). This usually means no unlocked keyring is reachable -- "
+            "a headless machine, a locked session, or a service account. Use "
+            "'kmitl-authen config --scheme b64' (or --scheme plain) instead, or "
+            "pass the password through KMITL_PASSWORD."
+        )
+    if failed:
+        raise ConfigError(f"OS credential store error during {label}: {failed[0]}")
+    return done[0] if done else None
+
+
+def _keyring_usable(timeout: float | None = None) -> bool:
+    """True only if a real round trip through the credential store completes.
+
+    Backend priority is not evidence: a chainer backend advertises priority 10
+    on a headless box where every call then blocks forever.
+    """
+    if timeout is None:
+        timeout = KEYRING_PROBE_TIMEOUT
+    try:
+        keyring = _keyring_module()
+    except ConfigError:
+        return False
+    try:
+        backend = keyring.get_keyring()
+        if getattr(backend, "priority", 0) <= 0:
+            return False
+        probe = "__kmitl_authen_probe__"
+        _keyring_call("probe-write", backend.set_password,
+                      _KEYRING_SERVICE, probe, "probe", timeout=timeout)
+        ok = _keyring_call("probe-read", backend.get_password,
+                           _KEYRING_SERVICE, probe, timeout=timeout) == "probe"
+        try:
+            _keyring_call("probe-delete", backend.delete_password,
+                          _KEYRING_SERVICE, probe, timeout=timeout)
+        except Exception:
+            pass
+        return bool(ok)
+    except Exception:
+        return False
+
+
 def best_scheme() -> str:
     """The strongest scheme that will actually work unattended here."""
     if _is_windows():
         return "dpapi"
-    keyring_ok = False
-    try:
-        import keyring
-
-        backend = keyring.get_keyring()
-        # A "fail" or "null" backend reports itself with priority <= 0.
-        keyring_ok = getattr(backend, "priority", 0) > 0
-    except Exception:
-        keyring_ok = False
-    return "keyring" if keyring_ok else "b64"
+    return "keyring" if _keyring_usable() else "b64"
 
 
 def protect(plaintext: str, scheme: str = "auto", account: str = "") -> str:
@@ -163,7 +232,8 @@ def protect(plaintext: str, scheme: str = "auto", account: str = "") -> str:
     # keyring
     if not account:
         raise ConfigError("the 'keyring' scheme needs the username")
-    _keyring_module().set_password(_KEYRING_SERVICE, account, plaintext)
+    _keyring_call("set_password", _keyring_module().set_password,
+                  _KEYRING_SERVICE, account, plaintext)
     return f"keyring:{account}"
 
 
@@ -199,7 +269,8 @@ def unprotect(stored: str) -> str:
             raise ConfigError(f"password_enc is not valid base64: {exc}") from exc
         return _dpapi(False, blob, scheme == "dpapi-machine").decode("utf-8")
     if scheme == "keyring":
-        secret = _keyring_module().get_password(_KEYRING_SERVICE, payload)
+        secret = _keyring_call("get_password", _keyring_module().get_password,
+                               _KEYRING_SERVICE, payload)
         if secret is None:
             raise ConfigError(
                 f"no password stored in the OS credential store for "

@@ -23,7 +23,10 @@ ExecStart=%h/.local/share/kmitl-authen/.venv/bin/python -m kmitl_authen run \
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=10s
-RestartPreventExitStatus=3
+# 3 = the portal rejected the credentials, 2 = the config is wrong. Neither
+# fixes itself by restarting, and restarting on 3 burns login attempts toward
+# an account lock.
+RestartPreventExitStatus=2 3
 
 [Install]
 WantedBy=default.target

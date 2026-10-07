@@ -35,9 +35,10 @@ ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
 RestartSec=10s
 
-# Exit 3 means the portal rejected the credentials. Restarting would just burn
-# login attempts toward an account lock, so stop and wait for a human.
-RestartPreventExitStatus=3
+# 3 = the portal rejected the credentials, 2 = the config is wrong. Neither
+# fixes itself by restarting, and restarting on 3 burns login attempts toward
+# an account lock.
+RestartPreventExitStatus=2 3
 
 # Let systemd notice a wedged process even if our own watchdog is disabled.
 WatchdogSec=0

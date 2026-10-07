@@ -21,8 +21,10 @@ services:
     env_file: .env
 
     # restart:unless-stopped is what turns the watchdog's exit(70) into a
-    # self-heal. Exit 3 (bad credentials) restarts too, so fix the password
-    # rather than leaving it to loop: `docker compose logs` says which it was.
+    # self-heal. Docker has no per-exit-code policy, so exit 2 (bad config) and
+    # exit 3 (bad credentials) restart too and will loop. `docker compose logs`
+    # names which it was; fix it rather than leaving it to spin. Use
+    # `restart: on-failure:5` instead if you would rather it give up.
     restart: unless-stopped
 
     volumes:

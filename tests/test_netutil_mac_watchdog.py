@@ -249,3 +249,102 @@ def test_watchdog_counter_survives_a_corrupt_file(tmp_path):
     (tmp_path / "watchdog_resets").write_text("not-a-number")
     Watchdog(timeout=1.0, state_dir=tmp_path)._record()
     assert read_reset_count(tmp_path) == 1
+
+
+# --- stall diagnostics -----------------------------------------------------
+# A watchdog that says "something stalled" without saying where is half a tool.
+
+def test_firing_writes_a_stall_report_naming_the_threads(tmp_path, monkeypatch):
+    exits = []
+    monkeypatch.setattr("os._exit", lambda code: exits.append(code))
+    dog = Watchdog(timeout=0.5, state_dir=tmp_path)
+    dog.start()
+    time.sleep(2.0)                       # never pet
+    dog.stop()
+
+    reports = sorted(tmp_path.glob("watchdog-stall-*.txt"))
+    assert reports, "no stall report was written"
+    text = reports[0].read_text()
+    assert "seconds since pet" in text
+    assert "last activity" in text
+    assert "--- thread:" in text
+    assert "MainThread" in text, "the stuck thread's stack is the whole point"
+    assert "watchdog" in text, "the watchdog thread should appear too"
+
+
+def test_stall_report_explains_how_to_read_it(tmp_path):
+    dog = Watchdog(timeout=1.0, state_dir=tmp_path)
+    path = dog._write_stall_report(stalled=200.0, allowed=180.0, grace=0.0,
+                                   activity="heartbeat")
+    assert path is not None
+    text = path.read_text()
+    # The distinction that actually matters when reading one of these.
+    assert "idle:NNNs" in text
+    assert "grace" in text
+    assert "last activity      : heartbeat" in text
+
+
+def test_stall_report_is_optional_without_a_state_dir():
+    dog = Watchdog(timeout=1.0, state_dir=None)
+    assert dog._write_stall_report(1.0, 1.0, 0.0, "x") is None
+
+
+def test_half_way_warning_fires_before_death(tmp_path, monkeypatch):
+    """Warn at 50% of the budget, while the process is still alive.
+
+    Records are captured with a handler attached directly to the logger
+    rather than via caplog: logging_setup.setup() sets propagate=False on
+    `kmitl_authen`, so whether caplog sees anything depends on which other
+    tests ran first.
+    """
+    import logging
+
+    exits = []
+    monkeypatch.setattr("os._exit", lambda code: exits.append(code))
+
+    captured = []
+
+    class Collect(logging.Handler):
+        def emit(self, record):
+            captured.append(record.getMessage())
+
+    handler = Collect()
+    logger = logging.getLogger("kmitl_authen")
+    logger.addHandler(handler)
+    previous = logger.level
+    logger.setLevel(logging.DEBUG)
+    try:
+        # timeout 6 -> poll 1s, half 3s. Checked at 1,2,3 (quiet) then 4 (warn),
+        # stopped at 4.5, death at 6. Wide margins on purpose: a boundary-tight
+        # version of this test was flaky.
+        dog = Watchdog(timeout=6.0, state_dir=tmp_path)
+        dog.start()
+        time.sleep(4.5)
+        dog.stop()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous)
+
+    assert exits == [], "it must not have fired yet"
+    assert any("watchdog_half_way" in m for m in captured), \
+        f"no early warning was logged; got {captured}"
+
+
+def test_innermost_frame_reports_a_real_location():
+    from kmitl_authen.watchdog import _innermost_frame
+    where = _innermost_frame()
+    assert ":" in where and " in " in where, where
+
+
+def test_thread_frames_covers_every_live_thread():
+    import threading as t
+    from kmitl_authen.watchdog import _thread_frames
+    stop = t.Event()
+    worker = t.Thread(target=stop.wait, name="probe-thread", daemon=True)
+    worker.start()
+    try:
+        labels = [label for label, _ in _thread_frames()]
+        assert any("probe-thread" in label for label in labels)
+        assert any("MainThread" in label for label in labels)
+    finally:
+        stop.set()
