@@ -6,6 +6,7 @@ never has to guard against ``None`` or a negative interval.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 from dataclasses import dataclass, field, fields
@@ -34,11 +35,199 @@ class ConfigError(Exception):
     """Raised for a configuration problem the user has to fix."""
 
 
+# ---------------------------------------------------------------------------
+#  Password storage
+# ---------------------------------------------------------------------------
+#  Be clear about what each scheme is worth, because "not plain text" and
+#  "protected" are different claims and only two of these make the second one.
+#
+#  dpapi / dpapi-machine  Windows DPAPI. Real encryption, key held by Windows.
+#                         Copying config.json to another machine is useless.
+#                         `dpapi` binds to one Windows account; `dpapi-machine`
+#                         to the machine, so any local account can decrypt it
+#                         (needed when the daemon runs as SYSTEM).
+#  keyring                The OS credential store. The secret leaves the file
+#                         entirely; only a pointer stays. Needs the `keyring`
+#                         package, and on Linux a *running, unlocked* Secret
+#                         Service, which a boot-time daemon usually lacks.
+#  b64                    Obfuscation, NOT encryption. Anyone can reverse it in
+#                         one line. It stops a shoulder-surf, a screenshot or a
+#                         careless `cat`, and nothing else.
+#  plain                  As before.
+#
+#  On Linux there is no way to hide a secret from a process already running as
+#  you. File permissions are the real control there; see `README.md`.
+
+SECRET_SCHEMES = ("dpapi", "dpapi-machine", "keyring", "b64", "plain")
+_STRONG_SCHEMES = ("dpapi", "dpapi-machine", "keyring")
+
+def _is_windows() -> bool:
+    """Single place the platform is decided, so tests can override just this.
+
+    Patching ``os.name`` instead would change it for ``pathlib`` too, which
+    starts handing out ``WindowsPath`` objects and takes the test runner with
+    it.
+    """
+    return os.name == "nt"
+
+
+_DPAPI_LOCAL_MACHINE = 0x4
+_DPAPI_UI_FORBIDDEN = 0x1
+_KEYRING_SERVICE = "kmitl-authen"
+
+
+def _dpapi(encrypt: bool, data: bytes, machine_scope: bool) -> bytes:
+    """Call CryptProtectData / CryptUnprotectData. Windows only."""
+    import ctypes
+    from ctypes import wintypes
+
+    class Blob(ctypes.Structure):
+        _fields_ = [("cbData", wintypes.DWORD),
+                    ("pbData", ctypes.POINTER(ctypes.c_char))]
+
+    crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    source = Blob(len(data), ctypes.cast(ctypes.create_string_buffer(data, len(data)),
+                                         ctypes.POINTER(ctypes.c_char)))
+    result = Blob()
+    flags = _DPAPI_UI_FORBIDDEN | (_DPAPI_LOCAL_MACHINE if machine_scope else 0)
+    func = crypt32.CryptProtectData if encrypt else crypt32.CryptUnprotectData
+
+    if encrypt:
+        ok = func(ctypes.byref(source), "kmitl-authen", None, None, None, flags,
+                  ctypes.byref(result))
+    else:
+        ok = func(ctypes.byref(source), None, None, None, None, flags,
+                  ctypes.byref(result))
+    if not ok:
+        raise ConfigError(
+            f"Windows DPAPI {'encryption' if encrypt else 'decryption'} failed "
+            f"(error {ctypes.get_last_error()}). If decrypting: this password was "
+            "encrypted by a different Windows account. Re-run 'kmitl-authen config' "
+            "as that account, or use --scheme dpapi-machine so any account on this "
+            "machine can read it."
+        )
+    try:
+        return ctypes.string_at(result.pbData, result.cbData)
+    finally:
+        kernel32.LocalFree(result.pbData)
+
+
+def _keyring_module():
+    try:
+        import keyring
+    except ImportError as exc:
+        raise ConfigError(
+            "the 'keyring' scheme needs the keyring package: pip install keyring"
+        ) from exc
+    return keyring
+
+
+def best_scheme() -> str:
+    """The strongest scheme that will actually work unattended here."""
+    if _is_windows():
+        return "dpapi"
+    keyring_ok = False
+    try:
+        import keyring
+
+        backend = keyring.get_keyring()
+        # A "fail" or "null" backend reports itself with priority <= 0.
+        keyring_ok = getattr(backend, "priority", 0) > 0
+    except Exception:
+        keyring_ok = False
+    return "keyring" if keyring_ok else "b64"
+
+
+def protect(plaintext: str, scheme: str = "auto", account: str = "") -> str:
+    """Turn a password into a tagged, storable string."""
+    if not plaintext:
+        raise ConfigError("cannot protect an empty password")
+    if scheme == "auto":
+        scheme = best_scheme()
+    if scheme not in SECRET_SCHEMES:
+        raise ConfigError(
+            f"unknown scheme {scheme!r}; choose one of: {', '.join(SECRET_SCHEMES)}"
+        )
+
+    if scheme == "plain":
+        return f"plain:{plaintext}"
+    if scheme == "b64":
+        return "b64:" + base64.b64encode(plaintext.encode("utf-8")).decode("ascii")
+    if scheme in ("dpapi", "dpapi-machine"):
+        if not _is_windows():
+            raise ConfigError(f"the {scheme!r} scheme is Windows-only")
+        blob = _dpapi(True, plaintext.encode("utf-8"), scheme == "dpapi-machine")
+        return f"{scheme}:" + base64.b64encode(blob).decode("ascii")
+    # keyring
+    if not account:
+        raise ConfigError("the 'keyring' scheme needs the username")
+    _keyring_module().set_password(_KEYRING_SERVICE, account, plaintext)
+    return f"keyring:{account}"
+
+
+def unprotect(stored: str) -> str:
+    """Recover a password from a tagged string. Raises ConfigError, never crashes."""
+    if not stored:
+        raise ConfigError("password_enc is empty")
+    if ":" not in stored:
+        raise ConfigError(
+            "password_enc must look like '<scheme>:<value>'; "
+            f"got something with no scheme. Valid schemes: {', '.join(SECRET_SCHEMES)}"
+        )
+    scheme, _, payload = stored.partition(":")
+    scheme = scheme.strip().lower()
+
+    if scheme == "plain":
+        return payload
+    if scheme == "b64":
+        try:
+            return base64.b64decode(payload.encode("ascii"), validate=True).decode("utf-8")
+        except Exception as exc:
+            raise ConfigError(f"password_enc is not valid base64: {exc}") from exc
+    if scheme in ("dpapi", "dpapi-machine"):
+        if not _is_windows():
+            raise ConfigError(
+                f"password_enc uses {scheme!r}, which only Windows can decrypt. "
+                "This config file cannot be used on this platform; re-run "
+                "'kmitl-authen config' here, or set KMITL_PASSWORD."
+            )
+        try:
+            blob = base64.b64decode(payload.encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ConfigError(f"password_enc is not valid base64: {exc}") from exc
+        return _dpapi(False, blob, scheme == "dpapi-machine").decode("utf-8")
+    if scheme == "keyring":
+        secret = _keyring_module().get_password(_KEYRING_SERVICE, payload)
+        if secret is None:
+            raise ConfigError(
+                f"no password stored in the OS credential store for "
+                f"{_KEYRING_SERVICE}/{payload}. Re-run 'kmitl-authen config'."
+            )
+        return secret
+    raise ConfigError(
+        f"unknown password_enc scheme {scheme!r}; valid: {', '.join(SECRET_SCHEMES)}"
+    )
+
+
+def scheme_of(stored: str) -> str:
+    return stored.partition(":")[0].strip().lower() if stored else ""
+
+
+def is_strong(stored: str) -> bool:
+    """True when the stored form is genuinely encrypted, not merely encoded."""
+    return scheme_of(stored) in _STRONG_SCHEMES
+
+
 @dataclass
 class Config:
     # --- credentials / identity -------------------------------------------
     username: str = ""
     password: str = ""
+    # Tagged, non-plaintext password: "<scheme>:<value>". Resolved into
+    # `password` by load(); see the Password storage block above.
+    password_enc: str = ""
     ip_address: str = ""
     mac_address: str = ""          # empty => auto-detect, then pinned in state
     acip: str = DEFAULT_ACIP
@@ -93,6 +282,8 @@ class Config:
             value = getattr(self, f.name)
             if f.name in ("password", "control_token") and value:
                 value = "***"
+            elif f.name == "password_enc" and value:
+                value = f"{scheme_of(value)}:***"
             out[f.name] = value
         return out
 
@@ -229,6 +420,15 @@ def load(args: Any = None, config_path: str | None = None) -> tuple[Config, Path
             value = getattr(args, f.name, None)
             if value is not None:
                 setattr(cfg, f.name, _coerce(f.name, value))
+
+    # Resolve the stored password last, so an explicit CLI flag or
+    # KMITL_PASSWORD still wins over whatever is in the file.
+    cfg.password_source = "none"
+    if cfg.password:
+        cfg.password_source = "plaintext"
+    elif cfg.password_enc:
+        cfg.password = unprotect(cfg.password_enc)
+        cfg.password_source = scheme_of(cfg.password_enc)
 
     cfg.validate()
     return cfg, used

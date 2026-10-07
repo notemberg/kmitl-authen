@@ -6,6 +6,7 @@ import argparse
 import getpass
 import time
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
@@ -60,6 +61,17 @@ def build_parser() -> argparse.ArgumentParser:
 
     cfg = sub.add_parser("config", help="write a config.json interactively")
     cfg.add_argument("--path", default="config.json")
+    cfg.add_argument("--scheme", default="auto",
+                     choices=["auto", *config_module.SECRET_SCHEMES],
+                     help="how to store the password (default: the strongest that "
+                          "works unattended on this platform)")
+
+    protect = sub.add_parser(
+        "protect",
+        help="re-store an existing config.json's plaintext password, encrypted")
+    protect.add_argument("--path", default="config.json")
+    protect.add_argument("--scheme", default="auto",
+                         choices=["auto", *config_module.SECRET_SCHEMES])
 
     probe = sub.add_parser(
         "doctor",
@@ -163,7 +175,18 @@ def _load(args: argparse.Namespace) -> tuple[Config, Path]:
     )
     log = logging_setup.get_logger("cli")
     log.debug("config_loaded", extra={"file": str(used) if used else "none",
-                                      "state_dir": str(state_dir)})
+                                      "state_dir": str(state_dir),
+                                      "password_source": getattr(cfg, "password_source", "?")})
+    source = getattr(cfg, "password_source", "")
+    if source == "plaintext" and used is not None:
+        log.warning(
+            "password_stored_as_plaintext",
+            extra={"file": str(used),
+                   "fix": f"run: {PROG} protect --path \"{used}\""},
+        )
+    elif source == "b64":
+        log.info("password_obfuscated_not_encrypted",
+                 extra={"note": "b64 is reversible by anyone with the file"})
     return cfg, state_dir
 
 
@@ -347,11 +370,21 @@ def cmd_config(args: argparse.Namespace) -> int:
         username = username.split("@", 1)[0]
         print(f"  (dropped the domain; using '{username}')")
 
+    try:
+        stored = config_module.protect(password, args.scheme, account=username)
+    except ConfigError as exc:
+        print(f"\nCould not protect the password: {exc}")
+        print("Nothing was written.")
+        return EXIT_CONFIG
+    scheme = config_module.scheme_of(stored)
+
     data: dict[str, object] = {}
     if username:
         data["username"] = username
-    if password:
+    if scheme == "plain":
         data["password"] = password
+    else:
+        data["password_enc"] = stored
     if ip_address:
         data["ip_address"] = ip_address
     if mac_address:
@@ -365,7 +398,89 @@ def cmd_config(args: argparse.Namespace) -> int:
         path.chmod(0o600)   # no-op semantics on Windows, meaningful on POSIX
     except OSError:
         pass
-    print(f"\nWrote {path}. It holds your password — keep it out of version control.")
+    _report_storage(path, scheme)
+    return EXIT_OK
+
+
+_SCHEME_NOTES = {
+    "dpapi": ("Encrypted with Windows DPAPI, bound to this Windows account.",
+              "Copying this file to another machine or account is useless."),
+    "dpapi-machine": ("Encrypted with Windows DPAPI, bound to this machine.",
+                      "Any account on THIS machine can decrypt it; other machines cannot."),
+    "keyring": ("Stored in the OS credential store. The file holds only a pointer.",
+                "Needs an unlocked credential store at startup, which a boot-time "
+                "service on Linux often does not have."),
+    "b64": ("Base64-encoded. This is obfuscation, NOT encryption.",
+            "Anyone with the file can reverse it in one line. It stops a "
+            "shoulder-surf or a screenshot, nothing more."),
+    "plain": ("Stored as plain text.", "Anyone who can read the file has your password."),
+}
+
+
+def _report_storage(path: Path, scheme: str) -> None:
+    headline, caveat = _SCHEME_NOTES.get(scheme, ("Stored.", ""))
+    print(f"\nWrote {path}")
+    print(f"  password storage : {scheme}")
+    print(f"  {headline}")
+    if caveat:
+        print(f"  {caveat}")
+    if os.name != "nt":
+        print(f"  File mode set to 600 (owner-only). On Linux that is the real")
+        print(f"  control: nothing can hide a secret from a process running as you.")
+    print("  Keep this file out of version control (.gitignore already covers it).")
+
+
+def cmd_protect(args: argparse.Namespace) -> int:
+    """Encrypt the password already sitting in a config file, in place."""
+    path = Path(args.path).expanduser()
+    if not path.is_file():
+        print(f"{PROG}: no config file at {path}", file=sys.stderr)
+        return EXIT_CONFIG
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"{PROG}: cannot read {path}: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+    if not isinstance(raw, dict):
+        print(f"{PROG}: {path} is not a JSON object", file=sys.stderr)
+        return EXIT_CONFIG
+
+    plaintext = raw.get("password") or ""
+    if not plaintext:
+        existing = raw.get("password_enc") or ""
+        if existing:
+            print(f"{path} already stores the password as "
+                  f"'{config_module.scheme_of(existing)}'. Nothing to do.")
+            print("To change the scheme, run 'kmitl-authen config' again.")
+            return EXIT_OK
+        print(f"{PROG}: {path} has no password to protect", file=sys.stderr)
+        return EXIT_CONFIG
+
+    username = raw.get("username") or ""
+    try:
+        stored = config_module.protect(plaintext, args.scheme, account=username)
+    except ConfigError as exc:
+        print(f"{PROG}: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    # Verify before destroying the only copy.
+    try:
+        if config_module.unprotect(stored) != plaintext:
+            raise ConfigError("the value did not survive a round trip")
+    except ConfigError as exc:
+        print(f"{PROG}: refusing to rewrite {path}: {exc}", file=sys.stderr)
+        return EXIT_CONFIG
+
+    raw.pop("password", None)
+    raw["password_enc"] = stored
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
+    try:
+        tmp.chmod(0o600)
+    except OSError:
+        pass
+    os.replace(tmp, path)
+    _report_storage(path, config_module.scheme_of(stored))
     return EXIT_OK
 
 
@@ -529,7 +644,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     argv = list(sys.argv[1:] if argv is None else argv)
-    known = {"run", "relogin", "status", "logout", "config", "doctor"}
+    known = {"run", "relogin", "status", "logout", "config", "doctor", "protect"}
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help", "--version")):
         argv.insert(0, "run")          # `kmitl-authen -u x -p y` keeps working
     elif argv[0] not in known and not argv[0].startswith("-"):
@@ -543,6 +658,7 @@ def main(argv: list[str] | None = None) -> int:
         "logout": cmd_logout,
         "config": cmd_config,
         "doctor": cmd_doctor,
+        "protect": cmd_protect,
     }
     handler = handlers.get(args.command or "run")
     if handler is None:  # pragma: no cover

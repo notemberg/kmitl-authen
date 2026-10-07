@@ -1,6 +1,12 @@
 # Runtime dependency. Pinned loosely so security fixes land on a reinstall.
 requests>=2.28,<3
 
-# Optional, but recommended: exact per-interface MAC detection. Without it the
+# Optional, recommended: exact per-interface MAC detection. Without it the
 # script falls back to /sys/class/net, Windows `getmac`, then uuid.getnode().
 psutil>=5.9
+
+# Optional: lets `config`/`protect` store the password in the OS credential
+# store instead of the config file (--scheme keyring). Windows does not need
+# it -- DPAPI is built in. On Linux a boot-time service usually cannot reach
+# an unlocked Secret Service, so b64 + chmod 600 is the realistic fallback.
+keyring>=24; sys_platform != "win32"

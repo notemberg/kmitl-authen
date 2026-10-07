@@ -89,6 +89,17 @@ if (-not (Test-Path $configPath)) {
         no_banner          = $true
     } | ConvertTo-Json | Set-Content -Path $configPath -Encoding UTF8
 
+    # Replace the plaintext password with a DPAPI blob. The task runs as
+    # SYSTEM, so machine scope is required: a user-scoped blob encrypted by
+    # the installing account could not be decrypted by SYSTEM at boot.
+    Write-Host 'Encrypting the password with Windows DPAPI (machine scope)'
+    & (Join-Path $InstallDir '.venv\Scripts\python.exe') -m kmitl_authen protect `
+        --path $configPath --scheme dpapi-machine
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "Could not encrypt the password; it is still plain text in $configPath"
+    }
+    $plain = $null
+
     # The file holds a password: restrict it to SYSTEM and Administrators.
     $acl = Get-Acl $configPath
     $acl.SetAccessRuleProtection($true, $false)

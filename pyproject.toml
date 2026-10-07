@@ -14,9 +14,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# psutil makes MAC/interface detection exact; everything works without it.
-full = ["psutil>=5.9"]
-dev = ["pytest>=7", "psutil>=5.9"]
+# psutil makes MAC/interface detection exact; keyring enables
+# `--scheme keyring`. Everything works without either.
+full = ["psutil>=5.9", "keyring>=24"]
+dev = ["pytest>=7", "psutil>=5.9", "keyring>=24"]
 
 [project.scripts]
 kmitl-authen = "kmitl_authen.cli:main"

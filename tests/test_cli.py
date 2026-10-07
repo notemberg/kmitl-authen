@@ -31,6 +31,10 @@ def test_every_config_field_is_reachable_from_the_cli():
         "log_max_bytes", "log_backup_count", "backoff_initial",
         "exit_on_credential_failure",   # exposed as --keep-retrying-bad-credentials
         "verify_tls",                   # exposed as --insecure
+        # Deliberately not a flag: you do not paste ciphertext into a shell,
+        # where it lands in the process list and the history file. It is
+        # written by `config` and `protect`.
+        "password_enc",
     }
     from dataclasses import fields
     missing = {f.name for f in fields(Config)} - dests - file_or_env_only

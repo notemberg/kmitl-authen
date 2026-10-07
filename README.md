@@ -26,7 +26,7 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 143 |
+| Tests | none | 166 |
 
 ---
 
@@ -87,8 +87,43 @@ export KMITL_USERNAME=65010000 KMITL_PASSWORD='...'
 kmitl-authen run -u 65010000 --ask-password
 ```
 
-Prefer `config.json` (chmod 600) or the environment. A password passed as an
-argument is visible to every other process via the process list.
+A password passed as an argument is visible to every other process via the
+process list, so prefer `config.json` or the environment.
+
+### Password storage
+
+`kmitl-authen config` never writes a plaintext password. It picks the strongest
+scheme that works unattended on your platform and writes `password_enc`
+instead. To convert a config you already have:
+
+```bash
+kmitl-authen protect                      # best available scheme
+kmitl-authen protect --scheme b64         # or pick one
+```
+
+| Scheme | Protects against | Does **not** protect against | Where |
+|---|---|---|---|
+| `dpapi` | The file being copied to another machine or Windows account | Anything running as you on this machine | Windows (default there) |
+| `dpapi-machine` | The file being copied to another machine | Any account on this machine | Windows; **required** when the daemon runs as SYSTEM |
+| `keyring` | The password being in the file at all — only a pointer remains | Anything running as you | Needs `pip install keyring`; on Linux also needs an unlocked Secret Service, which a boot-time service usually lacks |
+| `b64` | A shoulder-surf, a screenshot, a careless `cat` | **Anyone with the file.** This is obfuscation, not encryption — reversible in one line | Everywhere (Linux fallback) |
+| `plain` | Nothing | Nothing | Everywhere |
+
+Being blunt about the Linux case: there is no way to hide a secret from a
+process already running as you. `b64` stops you leaking the password by
+accident, and that is its whole value. The real control on Linux is file
+permissions — `config` and `protect` both `chmod 600` — plus running the
+daemon under its own account. If you want more than that, use `keyring` with a
+desktop session, or keep the password in a systemd `EnvironmentFile` with mode
+600 and let `KMITL_PASSWORD` carry it.
+
+The daemon logs a `password_stored_as_plaintext` warning at startup if it finds
+a plaintext password in a file, and a quieter `password_obfuscated_not_encrypted`
+note for `b64`, so you are never misled about which you have.
+
+Precedence is unchanged: `--password` beats `KMITL_PASSWORD`, which beats
+`password` in the file, which beats `password_enc`. Containers keep using the
+environment variable and ignore all of this.
 
 ---
 
@@ -244,7 +279,8 @@ as `--field-name` on the command line. Precedence: defaults < file < env < CLI.
 | Field | Default | |
 |---|---|---|
 | `username` | — | required; student ID, without `@kmitl.ac.th` |
-| `password` | — | required |
+| `password` | — | plaintext; prefer `password_enc` |
+| `password_enc` | — | `"<scheme>:<value>"`, written by `config` or `protect`. Not a CLI flag — ciphertext on a command line lands in the process list and the shell history |
 | `ip_address` | auto | the address claimed to the portal; auto-detected per login |
 | `mac_address` | auto | detected once, then pinned in `<state_dir>/identity.json` |
 | `acip` | `10.252.13.10` | the portal's access-controller address |
@@ -297,6 +333,9 @@ change needed.
 | `mac_changed_using_pinned` | a new adapter appeared; set `--mac-address` explicitly or delete `<state_dir>/identity.json` |
 | `uuid_getnode_is_random` | no MAC could be detected; set `mac_address` in the config |
 | anything unexplained | run `kmitl-authen doctor` — it prints the raw portal response next to the inferred verdict |
+| `password_stored_as_plaintext` | run `kmitl-authen protect` |
+| `password_enc uses 'dpapi'... only Windows can decrypt` | the config came from a Windows machine; re-run `kmitl-authen config` here |
+| `DPAPI decryption failed ... different Windows account` | encrypted by one account, read by another (commonly: you encrypted it, SYSTEM reads it). Re-run `protect --scheme dpapi-machine` |
 | `control_server_failed` | the port is taken — often an older copy of the daemon still running |
 | `long_gap_detected likely=suspend_or_clock_change` | normal after a laptop sleep; the daemon re-logs in by itself |
 | `long_gap_detected likely=stall` | something blocked the loop; check `monotonic_s` against `requested_s`, and look for a preceding `read_timeout` |
@@ -318,7 +357,7 @@ State, logs and the pinned identity live in:
 
 Being straight about this, because the failure modes here are subtle.
 
-**Tested, and would fail the build if broken** — 143 tests plus CI on Linux,
+**Tested, and would fail the build if broken** — 166 tests plus CI on Linux,
 Windows and macOS across Python 3.9/3.11/3.13:
 
 - every request carries a timeout (asserted below our own session wrapper)
@@ -382,7 +421,7 @@ not do one.
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 143 tests, no network needed
+python3 -m pytest                 # 166 tests, no network needed
 ```
 
 Layout:

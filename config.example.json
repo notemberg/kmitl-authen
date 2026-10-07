@@ -1,6 +1,8 @@
 {
   "username": "65010000",
-  "password": "your-password",
+
+  "_comment_password": "Do NOT put a plaintext password here. Run 'kmitl-authen config' (it writes password_enc for you), or 'kmitl-authen protect' to convert an existing plaintext config. Schemes, strongest first: dpapi / dpapi-machine (Windows, real encryption), keyring (OS credential store), b64 (obfuscation only), plain.",
+  "password_enc": "b64:eW91ci1wYXNzd29yZA==",
 
   "_comment_ip": "Leave ip_address out to auto-detect the source address toward the portal.",
   "ip_address": "",
