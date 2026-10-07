@@ -76,3 +76,22 @@ def test_timeout_tuple_is_always_set():
     cfg = Config(username="u", password="p")
     assert cfg.timeout == (cfg.connect_timeout, cfg.read_timeout)
     assert all(t > 0 for t in cfg.timeout)
+
+
+def test_watchdog_must_outlast_the_slowest_probe_too():
+    """probe_timeout counts as active work, so the watchdog must exceed it."""
+    cfg = Config(username="u", password="p", read_timeout=5, probe_timeout=300,
+                 connect_timeout=5, watchdog_timeout=60)
+    with pytest.raises(ConfigError, match="probe-timeout"):
+        cfg.validate()
+
+
+def test_watchdog_need_not_outlast_the_heartbeat_interval():
+    """A long sleep is declared to the watchdog as idle, so this is valid."""
+    cfg = Config(username="u", password="p", heartbeat_interval=300,
+                 watchdog_timeout=180)
+    cfg.validate()   # must not raise
+
+
+def test_shipped_defaults_are_valid():
+    Config(username="u", password="p").validate()

@@ -5,7 +5,7 @@ import pytest
 
 from kmitl_authen.config import Config
 from kmitl_authen.control import Controller
-from kmitl_authen.daemon import Daemon, State
+from kmitl_authen.daemon import MIN_TICK, Daemon, State
 from kmitl_authen.portal import Outcome, Result
 from kmitl_authen.watchdog import Watchdog
 
@@ -215,3 +215,81 @@ def test_no_scheduled_relogin_right_after_startup(daemon):
     daemon.started_monotonic = time.monotonic()
     daemon._tick(time.monotonic() + 999)
     assert "login" not in daemon.portal.calls
+
+
+# --- regressions from a real 12-hour run log --------------------------------
+
+def test_default_config_does_not_trip_its_own_watchdog():
+    """The shipped defaults must not make the daemon kill itself.
+
+    heartbeat_interval=300 against watchdog_timeout=180 means a healthy daemon
+    sleeps for longer than the watchdog's patience; without the idle grace it
+    exited 70 on every single cycle.
+    """
+    cfg = Config(username="u", password="p")
+    assert cfg.heartbeat_interval > cfg.watchdog_timeout, (
+        "this test is pointless unless the sleep really can exceed the timeout"
+    )
+    dog = Watchdog(cfg.watchdog_timeout)
+    dog.pet("idle", expected_idle=cfg.heartbeat_interval)
+    with dog._lock:
+        allowed = dog.timeout + dog._grace
+    assert allowed >= cfg.heartbeat_interval + cfg.read_timeout
+
+
+def test_sleep_declares_the_idle_period_to_the_watchdog(daemon, monkeypatch):
+    declared = []
+    monkeypatch.setattr(daemon.watchdog, "pet",
+                        lambda activity="", expected_idle=0.0: declared.append(expected_idle))
+    monkeypatch.setattr(daemon.controller, "wait", lambda s: "timeout")
+    daemon._sleep(300.0)
+    assert 300.0 in declared, f"the 300s sleep was not declared: {declared}"
+
+
+def test_long_gap_is_detected_and_forces_a_relogin(daemon):
+    """The run log went silent for 80 minutes between two heartbeats."""
+    daemon._check_gap(requested=300.0, mono_elapsed=4805.0, wall_elapsed=4805.0)
+    assert daemon.counters.long_gaps_total == 1
+    assert daemon.last_gap_seconds == 4805.0
+    assert daemon.controller.take_relogin_request() == "gap:stall"
+
+
+def test_suspend_is_distinguished_from_a_stall(daemon):
+    """A suspended machine advances the wall clock but not the monotonic one."""
+    daemon._check_gap(requested=300.0, mono_elapsed=301.0, wall_elapsed=4805.0)
+    assert daemon.controller.take_relogin_request() == "gap:suspend_or_clock_change"
+
+
+def test_normal_sleep_is_not_reported_as_a_gap(daemon):
+    daemon._check_gap(requested=300.0, mono_elapsed=301.2, wall_elapsed=301.2)
+    assert daemon.counters.long_gaps_total == 0
+    assert daemon.controller.take_relogin_request() is None
+
+
+def test_short_sleeps_get_an_absolute_floor_not_a_ratio(daemon):
+    """A 1s tick that takes 3s is scheduler noise, not a gap."""
+    daemon._check_gap(requested=1.0, mono_elapsed=3.0, wall_elapsed=3.0)
+    assert daemon.counters.long_gaps_total == 0
+
+
+def test_heartbeat_network_error_does_not_cause_a_login_storm(daemon):
+    """The log shows 122 logins in 9 seconds after one heartbeat exception.
+
+    The old code returned from start() on a heartbeat exception, re-entered,
+    and then hammered login() with no sleep while the portal kept rejecting.
+    """
+    daemon.portal = ScriptedPortal(
+        online=True, heartbeat_result=Result(Outcome.NETWORK_ERROR, "connection_error"))
+    daemon.portal.login_result = Result(Outcome.REJECTED, "portal rejected")
+
+    sleeps = []
+    for _ in range(8):
+        sleep_for, _ = daemon._tick(0.0)
+        sleeps.append(sleep_for)
+        daemon.portal.online = False      # still behind the captive portal
+
+    logins = daemon.portal.calls.count("login")
+    elapsed = sum(sleeps)
+    rate = logins / max(elapsed, 1e-9)
+    assert rate < 1.0, f"{logins} logins across {elapsed:.1f}s = {rate:.1f}/s"
+    assert all(s >= MIN_TICK for s in sleeps)

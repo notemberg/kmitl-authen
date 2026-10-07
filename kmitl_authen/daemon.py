@@ -38,6 +38,13 @@ MIN_TICK = 1.0
 POST_LOGIN_RECHECK = 3.0
 CREDENTIAL_COOLDOWN = 900.0
 
+# A wait that overruns by more than max(GAP_MIN_SECONDS, requested * GAP_FACTOR)
+# is treated as a gap: the process was suspended, or something stalled it. In a
+# real run log this showed up as 80 minutes of total silence between two
+# heartbeats, with no indication of which it was.
+GAP_FACTOR = 2.0
+GAP_MIN_SECONDS = 60.0
+
 
 class State:
     STARTING = "starting"
@@ -59,6 +66,7 @@ class Counters:
     forced_relogins_total: int = 0
     probe_failures_total: int = 0
     unexpected_errors_total: int = 0
+    long_gaps_total: int = 0
     extras: dict[str, Any] = field(default_factory=dict)
 
 
@@ -105,6 +113,7 @@ class Daemon:
         self.last_heartbeat: float | None = None
         self.last_heartbeat_latency_ms = 0
         self.last_detail = ""
+        self.last_gap_seconds = 0.0
         self.login_attempts_since_success = 0
         self.watchdog_resets = read_reset_count(state_dir)
         controller.set_status_provider(self.status)
@@ -148,6 +157,8 @@ class Daemon:
             "forced_relogins_total": self.counters.forced_relogins_total,
             "probe_failures_total": self.counters.probe_failures_total,
             "unexpected_errors_total": self.counters.unexpected_errors_total,
+            "long_gaps_total": self.counters.long_gaps_total,
+            "last_gap_seconds": self.last_gap_seconds,
             "relogin_trigger_file": str(self.controller.trigger_file),
         }
 
@@ -295,9 +306,7 @@ class Daemon:
 
             if self.controller.shutdown.is_set():
                 break
-            woke = self.controller.wait(max(MIN_TICK, sleep_for))
-            if woke == "relogin":
-                log.debug("wait_interrupted", extra={"by": woke})
+            self._sleep(max(MIN_TICK, sleep_for))
 
         self._set_state(State.STOPPED)
         log.info("stopped", extra={"exit_code": exit_code, **{
@@ -307,6 +316,51 @@ class Daemon:
         }})
         self.portal.close()
         return exit_code
+
+    def _sleep(self, seconds: float) -> None:
+        """Wait, declaring the idle period to the watchdog, then check for a gap."""
+        self.watchdog.pet(f"idle:{seconds:.0f}s", expected_idle=seconds)
+        mono_before, wall_before = time.monotonic(), time.time()
+
+        woke = self.controller.wait(seconds)
+
+        mono_elapsed = time.monotonic() - mono_before
+        wall_elapsed = time.time() - wall_before
+        self.watchdog.pet("awake")
+        if woke == "relogin":
+            log.debug("wait_interrupted", extra={"by": woke})
+        self._check_gap(seconds, mono_elapsed, wall_elapsed)
+
+    def _check_gap(self, requested: float, mono_elapsed: float, wall_elapsed: float) -> None:
+        """Notice, name and react to a wait that took far longer than asked.
+
+        Comparing the monotonic and wall-clock deltas separates the two causes:
+        a suspended machine advances the wall clock while the monotonic clock
+        stands still (on Linux; Windows may advance both), whereas a genuine
+        stall advances both together. Either way the portal session is almost
+        certainly stale after a long absence, so force a re-login rather than
+        carrying on and discovering it at the next heartbeat.
+        """
+        allowance = max(GAP_MIN_SECONDS, requested * GAP_FACTOR)
+        overrun = max(mono_elapsed, wall_elapsed)
+        if overrun <= allowance:
+            return
+
+        skew = wall_elapsed - mono_elapsed
+        likely = "suspend_or_clock_change" if abs(skew) >= GAP_MIN_SECONDS else "stall"
+        self.counters.long_gaps_total += 1
+        self.last_gap_seconds = round(overrun, 1)
+        log.warning(
+            "long_gap_detected",
+            extra={
+                "requested_s": round(requested, 1),
+                "monotonic_s": round(mono_elapsed, 1),
+                "wall_clock_s": round(wall_elapsed, 1),
+                "skew_s": round(skew, 1),
+                "likely": likely,
+            },
+        )
+        self.controller.request_relogin(f"gap:{likely}")
 
     def _tick(self, next_heartbeat: float) -> tuple[float, float]:
         """One iteration. Returns ``(sleep_seconds, next_heartbeat_monotonic)``."""

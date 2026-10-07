@@ -246,6 +246,134 @@ history after the window closed, no way to ask a running instance anything.
 
 ---
 
+## Appendix: evidence from a real 12-hour run
+
+A 12-hour log of `newauthen.py` (2026-10-07, 02:16 → 14:18, 258 timestamped
+lines) confirms findings 1, 5 and 6 with measurements rather than inference.
+
+### The heartbeat cadence, and the two breaks in it
+
+128 heartbeats, nearly all exactly 300 s apart. Only two gaps were not:
+
+| | |
+|---|---|
+| `06:22:21 → 06:32:33` | 612 s — a heartbeat exception, then recovery (below) |
+| `11:58:09 → 13:18:14` | **4805 s = 80.1 minutes of total silence** |
+
+The 80-minute gap is the reported symptom: 16 heartbeats simply never
+happened, nothing was logged, and then the loop carried on as if nothing had
+occurred. The log cannot say which of two causes it was —
+
+- a heartbeat POST that blocked for 75 minutes, because no call had a timeout
+  (finding 1); or
+- the machine suspending, with `time.sleep(300)` resuming late.
+
+— and **that ambiguity is itself the finding**. The old script had no way to
+tell you, because it logged nothing but successes.
+
+`daemon._check_gap()` now closes this. After every wait it compares the
+monotonic and wall-clock deltas against what it asked for, and when a wait
+overran by more than `max(60s, 2 × requested)` it logs the gap and forces a
+re-login, because a portal session is almost certainly stale after a long
+absence:
+
+```
+WARNING long_gap_detected requested_s=300.0 monotonic_s=4805.0 wall_clock_s=4805.0 skew_s=0.0 likely=stall
+INFO    relogin_requested reason=gap:stall
+INFO    login_ok reason=forced:gap:stall outcome=ok status=200 latency_ms=241
+```
+
+A suspended machine advances the wall clock while the monotonic clock stands
+still, so `skew_s` separates the two causes (on Linux; Windows may advance
+both, which is why both numbers are logged rather than just a verdict).
+`long_gaps_total` and `last_gap_seconds` are in `/status` and `/metrics`.
+Tests: `test_long_gap_is_detected_and_forces_a_relogin`,
+`test_suspend_is_distinguished_from_a_stall`.
+
+### The login storm, measured
+
+At `06:27:21` a heartbeat raised an exception — `heatbeat()` returned
+`(False, False)`, so `start()` hit `if not connection and not heatdone: return`
+and the outer `while True: start()` re-entered with `login_attempt = 0`. The
+fresh `start()` then fell into the branch from finding 5, and:
+
+> **122 rejected logins between 06:27:23 and 06:27:32 — 13.6 requests per
+> second** against the campus portal, for nine seconds.
+
+`Error! Please recheck your username and password...` appears exactly once, at
+attempt 20, and then the loop carried straight on to attempt 122 — which is
+finding 5's "the maximum was never enforced", observed in production.
+
+That the portal eventually accepted the 122nd attempt is luck. A portal with
+rate limiting would have locked the account.
+
+The replacement classifies a heartbeat exception as a transient network error,
+re-logs in **once**, and backs off with jitter.
+`test_heartbeat_network_error_does_not_cause_a_login_storm` asserts the
+sustained rate stays below 1 request/second — a 13× margin against the
+measured 13.6/s.
+
+### The 8-hour cycle is working as designed
+
+The last two `Welcome` banners are 28250 s apart = 7.85 h, which is the
+`reset_timer` of 8 h minus the 600 s early return. That one is intentional, not
+a fault. It is now `relogin_interval`, and it no longer needs to tear down and
+restart the whole loop to happen.
+
+---
+
+## Appendix: a bug this rewrite introduced, and the log that caught it
+
+Checking the new daemon against the 300-second cadence above exposed a
+self-inflicted fault worse than the original.
+
+The watchdog was petted once per loop iteration, and an iteration sleeps for
+`heartbeat_interval` between heartbeats. With the shipped defaults —
+`heartbeat_interval=300`, `watchdog_timeout=180` — a **perfectly healthy**
+daemon went 300 s without petting, so the watchdog fired every single cycle:
+
+```
+INFO     online username=... heartbeat_interval=30.0
+CRITICAL watchdog_fired stalled_s=18.6 timeout_s=18.0 last_activity=probe action=exit(70)
+```
+
+Under systemd or compose that is a restart every three minutes, forever. The
+test suite missed it because every test used a 5-second interval against a
+30-second watchdog, so the sleep never exceeded the timeout.
+
+The fix is for the watchdog to distinguish deliberate idleness from a stall:
+`Watchdog.pet(activity, expected_idle=...)` extends the deadline for a sleep
+the daemon is about to take on purpose, and `Daemon._sleep()` declares it.
+`config.validate()` now also requires `watchdog_timeout` to exceed
+`connect_timeout + max(read_timeout, probe_timeout)` — the slowest single
+request — while explicitly *not* requiring it to exceed `heartbeat_interval`.
+
+Guarded by `test_default_config_does_not_trip_its_own_watchdog`, which asserts
+against the shipped defaults rather than test-local ones, plus
+`test_sleep_declares_the_idle_period_to_the_watchdog`.
+
+### And one more, from chasing the label in that log
+
+While reproducing a silent portal, the probe failure came back as
+`reason=connection_error` when it was really a 6-second read timeout. The cause
+was the explicit `urllib3.util.retry.Retry(read=0)` on the HTTP adapter: on
+timeout it raises `MaxRetryError`, which requests surfaces as a generic
+`ConnectionError`. requests' own default, `Retry(0, read=False)`, re-raises the
+original `ReadTimeout`.
+
+That mislabelling destroyed the single most useful distinction in these logs —
+"the network is down" versus "the portal accepted our connection and then went
+silent", the latter being finding 1's exact signature. The custom `Retry` is
+gone, and `describe_exception()` now walks the whole `__cause__`/`__context__`
+chain, so a timeout is reported as one however it arrives, and DNS failures and
+refused connections get their own labels. Confirmed end to end:
+
+```
+DEBUG probe_error url=http://.../probe reason=read_timeout
+```
+
+---
+
 ## Summary
 
 | # | Problem | Guardrail |
@@ -260,3 +388,6 @@ history after the window closed, no way to ask a running instance anything.
 | 8 | `uuid.getnode()` MAC could change between runs | Interface-aware detection, virtual-adapter filtering, pinned identity |
 | 9 | A hang stayed hung | Watchdog → `exit(70)` → supervisor restart |
 | 10 | No observability | Rotating + JSON logs, redaction, `/status`, `/metrics`, `/healthz` |
+| 11 | An 80-minute silent gap, cause unknowable | Gap detection: both clock deltas logged, forced re-login |
+| 12 | *(introduced here)* watchdog fired during a normal 300 s sleep | `expected_idle` grace + a test against the shipped defaults |
+| 13 | *(introduced here)* a read timeout reported as `connection_error` | custom `Retry` removed; the whole cause chain is inspected |

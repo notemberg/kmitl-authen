@@ -29,13 +29,24 @@ class Watchdog:
         self.state_dir = state_dir
         self._last_pet = time.monotonic()
         self._activity = "startup"
+        self._grace = 0.0
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
-    def pet(self, activity: str = "") -> None:
+    def pet(self, activity: str = "", expected_idle: float = 0.0) -> None:
+        """Record progress.
+
+        ``expected_idle`` declares a deliberate sleep that is about to happen,
+        and extends the deadline for it. Without this the watchdog cannot tell
+        "blocked in a syscall for five minutes" from "waiting five minutes
+        between heartbeats, exactly as configured", and with the default
+        300s interval against a 180s timeout it would kill a healthy daemon on
+        every single cycle.
+        """
         with self._lock:
             self._last_pet = time.monotonic()
+            self._grace = max(0.0, expected_idle)
             if activity:
                 self._activity = activity
 
@@ -56,12 +67,14 @@ class Watchdog:
             with self._lock:
                 stalled = time.monotonic() - self._last_pet
                 activity = self._activity
-            if stalled <= self.timeout:
+                allowed = self.timeout + self._grace
+            if stalled <= allowed:
                 continue
             log.critical(
                 "watchdog_fired",
                 extra={
                     "stalled_s": round(stalled, 1),
+                    "allowed_s": round(allowed, 1),
                     "timeout_s": self.timeout,
                     "last_activity": activity,
                     "action": f"exit({EXIT_WATCHDOG}) for supervisor restart",

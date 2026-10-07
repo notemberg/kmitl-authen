@@ -267,6 +267,8 @@ def _prometheus(status: dict[str, Any]) -> str:
         "heartbeat_failures_total": ("counter", "Failed heartbeats."),
         "network_errors_total": ("counter", "Transport-level errors."),
         "forced_relogins_total": ("counter", "Re-logins requested from outside."),
+        "long_gaps_total": ("counter", "Waits that overran badly (suspend or stall)."),
+        "last_gap_seconds": ("gauge", "Length of the most recent overrun."),
         "watchdog_resets_total": ("counter", "Watchdog-triggered restarts recorded."),
         "last_heartbeat_latency_ms": ("gauge", "Latency of the last heartbeat."),
         "seconds_since_last_success": ("gauge", "Age of the last confirmed-online moment."),

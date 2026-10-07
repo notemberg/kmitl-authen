@@ -57,6 +57,73 @@ def test_exception_labels_are_stable(exc, label):
     assert netutil.describe_exception(exc) == label
 
 
+def test_a_wrapped_timeout_is_still_reported_as_a_timeout():
+    """"portal went silent" must never be flattened into "connection_error".
+
+    Depending on the urllib3 version and whether the socket was fresh or
+    reused, a read timeout can arrive wrapped in a generic ConnectionError.
+    That is the signature of the original hang, so it has to survive.
+    """
+    try:
+        try:
+            raise requests.exceptions.ReadTimeout("Read timed out")
+        except requests.exceptions.ReadTimeout as inner:
+            raise requests.exceptions.ConnectionError("Max retries exceeded") from inner
+    except requests.exceptions.ConnectionError as outer:
+        assert netutil.describe_exception(outer) == "read_timeout"
+
+
+def test_a_wrapped_connect_timeout_survives_too():
+    try:
+        try:
+            raise TimeoutError("timed out")
+        except TimeoutError as inner:
+            raise requests.exceptions.ConnectionError("wrapped") from inner
+    except requests.exceptions.ConnectionError as outer:
+        assert netutil.describe_exception(outer) == "timeout"
+
+
+def test_dns_failure_is_labelled_separately():
+    import socket as s
+    try:
+        try:
+            raise s.gaierror("Name or service not known")
+        except s.gaierror as inner:
+            raise requests.exceptions.ConnectionError("dns") from inner
+    except requests.exceptions.ConnectionError as outer:
+        assert netutil.describe_exception(outer) == "dns_error"
+
+
+def test_connection_refused_is_distinguished_from_a_timeout():
+    try:
+        try:
+            raise ConnectionRefusedError(111, "Connection refused")
+        except ConnectionRefusedError as inner:
+            raise requests.exceptions.ConnectionError("refused") from inner
+    except requests.exceptions.ConnectionError as outer:
+        assert netutil.describe_exception(outer) == "connection_refused"
+
+
+def test_exception_chain_walk_terminates_on_a_cycle():
+    a = ValueError("a")
+    b = ValueError("b")
+    a.__context__ = b
+    b.__context__ = a
+    assert len(netutil._exception_chain(a)) <= 8
+
+
+def test_no_transport_level_retries_are_configured():
+    """A urllib3 Retry here would mask the real exception type."""
+    session = netutil.build_session((1.0, 1.0), "ua")
+    for adapter in session.adapters.values():
+        assert adapter.max_retries.total in (0, False), (
+            "transport retries would wrap timeouts in MaxRetryError"
+        )
+        assert adapter.max_retries.read is False, (
+            "read=0 wraps the timeout; read=False re-raises the original"
+        )
+
+
 def test_reset_closes_adapters():
     session = netutil.build_session((1.0, 1.0), "ua")
     closed = []

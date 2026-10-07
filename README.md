@@ -26,7 +26,7 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 101 |
+| Tests | none | 117 |
 
 ---
 
@@ -73,7 +73,7 @@ argument is visible to every other process via the process list.
 
 ```bash
 kmitl-authen run --control-port 8777          # enable the control server
-kmitl-authen status                           # full state as JSON
+kmitl-authen status                           # full state as JSON, incl. long_gaps_total
 curl -s localhost:8777/metrics                # Prometheus
 curl -s -o /dev/null -w '%{http_code}\n' localhost:8777/healthz   # 200 online, 503 not
 tail -f ~/.local/state/kmitl-authen/kmitl-authen.log
@@ -86,7 +86,16 @@ Logs are `timestamp LEVEL event key=value ...`, so they grep cleanly:
 2026-10-07 13:53:44 INFO    heartbeat_ok outcome=ok status=200 latency_ms=44
 2026-10-07 13:58:44 WARNING heartbeat_failed outcome=rejected status=403 latency_ms=38
 2026-10-07 13:58:44 INFO    state_change from=online to=logging_in reason=heartbeat_failed
+2026-10-07 15:21:03 WARNING long_gap_detected requested_s=300.0 monotonic_s=4805.0 wall_clock_s=4805.0 skew_s=0.0 likely=stall
+2026-10-07 15:21:03 INFO    relogin_requested reason=gap:stall
 ```
+
+The `long_gap_detected` line is the one the old script could not produce. A
+real 12-hour run went **80 minutes** between two heartbeats with nothing
+logged at all (see [DIAGNOSIS.md](DIAGNOSIS.md)); there was no way to tell
+whether a request had blocked or the laptop had slept. Comparing the monotonic
+and wall-clock deltas separates those, and either way the daemon now forces a
+re-login instead of carrying on with a stale session.
 
 `--log-json` emits one JSON object per line for Loki, Elastic or `jq`. The
 password and control token are stripped from every record, so a log file is
@@ -226,7 +235,7 @@ as `--field-name` on the command line. Precedence: defaults < file < env < CLI.
 | `connect_timeout` | `5` | TCP connect budget |
 | `read_timeout` | `15` | response budget — **this is what prevents the hang** |
 | `probe_timeout` | `6` | connectivity-probe read budget |
-| `watchdog_timeout` | `180` | hard-exit if an iteration stalls this long; `0` disables |
+| `watchdog_timeout` | `180` | hard-exit if active work stalls this long; `0` disables. Must exceed `connect_timeout + max(read_timeout, probe_timeout)`. It does **not** need to exceed `heartbeat_interval` — a deliberate sleep is declared to the watchdog as idle time |
 | `backoff_initial` / `backoff_max` | `2` / `120` | retry backoff bounds |
 
 ### Failure policy
@@ -265,6 +274,9 @@ change needed.
 | `mac_changed_using_pinned` | a new adapter appeared; set `--mac-address` explicitly or delete `<state_dir>/identity.json` |
 | `uuid_getnode_is_random` | no MAC could be detected; set `mac_address` in the config |
 | `control_server_failed` | the port is taken — often an older copy of the daemon still running |
+| `long_gap_detected likely=suspend_or_clock_change` | normal after a laptop sleep; the daemon re-logs in by itself |
+| `long_gap_detected likely=stall` | something blocked the loop; check `monotonic_s` against `requested_s`, and look for a preceding `read_timeout` |
+| `read_timeout` on the portal | it accepted the connection and went silent — the original hang, now handled in `read_timeout` seconds |
 | online but no internet | the portal session is bound to a different IP; set `ip_address` explicitly |
 
 State, logs and the pinned identity live in:
@@ -282,7 +294,7 @@ State, logs and the pinned identity live in:
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 101 tests, no network needed
+python3 -m pytest                 # 117 tests, no network needed
 ```
 
 Layout:

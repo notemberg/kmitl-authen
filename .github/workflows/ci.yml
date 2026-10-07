@@ -87,6 +87,25 @@ jobs:
           if ($ticks -lt 2) { throw "the loop stalled: only $ticks probe attempts" }
           Stop-Process -Id $p.Id -Force
 
+      - name: Healthy daemon survives a sleep longer than the watchdog timeout
+        shell: bash
+        run: |
+          # Regression guard: with the shipped 300s heartbeat against a 180s
+          # watchdog, the daemon used to exit 70 on every cycle. Scaled 10x.
+          set +e
+          timeout 70 python -m kmitl_authen run \
+            -u ci-user -p ci-pass \
+            --state-dir "$RUNNER_TEMP/cadence" \
+            --probe-urls http://127.0.0.1:1/dead \
+            --login-url http://127.0.0.1:1/dead \
+            --heartbeat-interval 30 --watchdog-timeout 18 \
+            --connect-timeout 1 --read-timeout 6 --probe-timeout 6 \
+            --backoff-max 30 --no-banner
+          code=$?
+          set -e
+          test "$code" -ne 70 || { echo "the watchdog killed a healthy daemon"; exit 1; }
+          ! grep -q watchdog_fired "$RUNNER_TEMP/cadence/kmitl-authen.log"
+
       - name: Trigger-file re-login works with no daemon running
         shell: bash
         run: |

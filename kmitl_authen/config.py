@@ -108,8 +108,16 @@ class Config:
             raise ConfigError("heartbeat-interval must be >= 5 seconds")
         if self.connect_timeout <= 0 or self.read_timeout <= 0:
             raise ConfigError("connect-timeout and read-timeout must be > 0")
-        if self.watchdog_timeout and self.watchdog_timeout <= self.read_timeout:
-            raise ConfigError("watchdog-timeout must be larger than read-timeout")
+        # The watchdog must outlast the slowest single request, or it fires on
+        # a legitimately slow call. It does NOT need to outlast
+        # heartbeat_interval: a deliberate sleep is declared to it as idle time.
+        slowest_request = max(self.read_timeout, self.probe_timeout) + self.connect_timeout
+        if self.watchdog_timeout and self.watchdog_timeout <= slowest_request:
+            raise ConfigError(
+                f"watchdog-timeout ({self.watchdog_timeout:g}s) must exceed the slowest "
+                f"single request, which is connect-timeout + max(read-timeout, "
+                f"probe-timeout) = {slowest_request:g}s"
+            )
         if not self.probe_urls:
             raise ConfigError("at least one probe URL is required")
         if self.control_port and not (0 < self.control_port < 65536):

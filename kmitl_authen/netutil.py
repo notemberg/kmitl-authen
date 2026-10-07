@@ -21,7 +21,6 @@ from typing import Any
 
 import requests
 from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 from .logging_setup import get_logger
 
@@ -45,20 +44,19 @@ def _keepalive_socket_options() -> list[tuple[int, int, int]]:
 class TimedSession(requests.Session):
     """A ``Session`` that refuses to make a request without a timeout."""
 
-    def __init__(self, timeout: tuple[float, float], retries: int = 0) -> None:
+    def __init__(self, timeout: tuple[float, float]) -> None:
         super().__init__()
         self._timeout = timeout
-        retry = Retry(
-            total=retries,
-            connect=retries,
-            read=0,          # a hung read is retried by our own loop, with logging
-            status=0,
-            backoff_factor=0.5,
-            allowed_methods=None,
-            raise_on_status=False,
-        )
+        # No transport-level retries: our own loop retries, with backoff and a
+        # log line for each attempt. Passing an explicit urllib3 ``Retry`` here
+        # is actively harmful -- ``Retry(read=0)`` wraps a ``ReadTimeoutError``
+        # in ``MaxRetryError``, which requests then surfaces as a generic
+        # ``ConnectionError``. That throws away the one distinction that
+        # matters most here: "the network is down" versus "the portal accepted
+        # our connection and then went silent", which is the original hang.
+        # requests' default (``Retry(0, read=False)``) re-raises the original.
         adapter = HTTPAdapter(
-            max_retries=retry,
+            max_retries=0,
             pool_connections=4,
             pool_maxsize=4,
             pool_block=False,
@@ -83,7 +81,7 @@ def build_session(
     user_agent: str,
     verify_tls: bool = True,
 ) -> TimedSession:
-    session = TimedSession(timeout=timeout)
+    session = TimedSession(timeout)
     session.verify = verify_tls
     session.headers.update(
         {
@@ -117,22 +115,60 @@ def reset(session: TimedSession) -> None:
         log.debug("session_reset_failed", extra={"error": str(exc)})
 
 
+def _exception_chain(exc: BaseException, limit: int = 8) -> list[BaseException]:
+    """``exc`` and what it was raised from, innermost causes included."""
+    chain: list[BaseException] = []
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and len(chain) < limit and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
 def describe_exception(exc: BaseException) -> str:
-    """Short, stable label for an exception, for logs and counters."""
-    if isinstance(exc, requests.exceptions.ConnectTimeout):
-        return "connect_timeout"
-    if isinstance(exc, requests.exceptions.ReadTimeout):
-        return "read_timeout"
-    if isinstance(exc, requests.exceptions.Timeout):
-        return "timeout"
-    if isinstance(exc, requests.exceptions.SSLError):
-        return "tls_error"
-    if isinstance(exc, requests.exceptions.ProxyError):
-        return "proxy_error"
+    """Short, stable label for an exception, for logs and counters.
+
+    The whole cause chain is inspected, not just the outermost type. A timeout
+    can reach us wrapped in something more generic depending on the urllib3
+    version and whether the socket was fresh or reused, and reporting that as a
+    plain "connection_error" would hide the timeout we most want to see.
+    """
+    chain = _exception_chain(exc)
+
+    # Specific timeouts first: these are the signature of the original hang.
+    for item in chain:
+        if isinstance(item, requests.exceptions.ConnectTimeout):
+            return "connect_timeout"
+        if isinstance(item, requests.exceptions.ReadTimeout):
+            return "read_timeout"
+        if type(item).__name__ == "ConnectTimeoutError":
+            return "connect_timeout"
+        if type(item).__name__ == "ReadTimeoutError":
+            return "read_timeout"
+    for item in chain:
+        if isinstance(item, requests.exceptions.Timeout) or isinstance(item, TimeoutError):
+            return "timeout"
+
+    for item in chain:
+        if isinstance(item, requests.exceptions.SSLError):
+            return "tls_error"
+        if isinstance(item, requests.exceptions.ProxyError):
+            return "proxy_error"
+        if isinstance(item, requests.exceptions.TooManyRedirects):
+            return "too_many_redirects"
+
+    for item in chain:
+        if type(item).__name__ == "NameResolutionError" or isinstance(item, socket.gaierror):
+            return "dns_error"
+        if isinstance(item, ConnectionRefusedError):
+            return "connection_refused"
+        if isinstance(item, ConnectionResetError):
+            return "connection_reset"
+
     if isinstance(exc, requests.exceptions.ConnectionError):
         return "connection_error"
-    if isinstance(exc, requests.exceptions.TooManyRedirects):
-        return "too_many_redirects"
     if isinstance(exc, requests.exceptions.RequestException):
         return "request_error"
     return type(exc).__name__
