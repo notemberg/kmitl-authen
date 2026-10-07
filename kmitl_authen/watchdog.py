@@ -61,8 +61,16 @@ class Watchdog:
         self._thread.start()
         log.debug("watchdog_started", extra={"timeout_s": self.timeout})
 
-    def stop(self) -> None:
+    def stop(self, join_timeout: float = 2.0) -> None:
+        """Stop guarding, and wait for the thread to actually be gone.
+
+        Returning while the thread is still mid-decision would leave it able
+        to call ``os._exit`` after the caller believes the watchdog is off.
+        """
         self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive() and join_timeout > 0:
+            thread.join(join_timeout)
 
     def _run(self) -> None:
         poll = max(1.0, min(5.0, self.timeout / 10))
@@ -99,6 +107,12 @@ class Watchdog:
             if stalled <= allowed:
                 continue
 
+            # Told to stop while we were deciding: a clean shutdown must not
+            # be turned into exit(70). stop() only sets the event, so without
+            # this re-check an in-flight fire outlives the daemon it guards.
+            if self._stop.is_set():
+                return
+
             dump = self._write_stall_report(stalled, allowed, grace, activity)
             log.critical(
                 "watchdog_fired",
@@ -119,6 +133,8 @@ class Watchdog:
                     handler.flush()
                 except Exception:
                     pass
+            if self._stop.is_set():       # checked again: writing took time
+                return
             os._exit(EXIT_WATCHDOG)
 
     def _write_stall_report(

@@ -26,7 +26,7 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 178 |
+| Tests | none | 179 |
 
 ---
 
@@ -357,7 +357,7 @@ State, logs and the pinned identity live in:
 
 Being straight about this, because the failure modes here are subtle.
 
-**Tested, and would fail the build if broken** — 178 tests plus CI on Linux,
+**Tested, and would fail the build if broken** — 179 tests plus CI on Linux,
 Windows and macOS across Python 3.9/3.11/3.13:
 
 - every request carries a timeout (asserted below our own session wrapper)
@@ -421,7 +421,7 @@ not do one.
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 178 tests, no network needed
+python3 -m pytest                 # 179 tests, no network needed
 ```
 
 Layout:

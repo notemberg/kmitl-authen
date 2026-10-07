@@ -348,3 +348,24 @@ def test_thread_frames_covers_every_live_thread():
         assert any("MainThread" in label for label in labels)
     finally:
         stop.set()
+
+
+def test_stop_prevents_an_in_flight_fire(tmp_path, monkeypatch):
+    """A clean shutdown must never be reported as a watchdog kill.
+
+    stop() used to only set the event, so a thread already past its sleep and
+    into the firing path would still call os._exit -- which turned a clean
+    exit 0 into exit 70. It killed the test runner doing exactly this.
+    """
+    exits = []
+    monkeypatch.setattr("os._exit", lambda code: exits.append(code))
+    dog = Watchdog(timeout=0.5, state_dir=tmp_path)
+    dog.start()
+    time.sleep(1.5)                       # let it fire at least once
+    assert exits, "precondition: it should have fired while running"
+    before = len(exits)
+    dog.stop()
+    time.sleep(1.5)                       # nothing more may happen after stop
+    assert len(exits) == before, "it fired after being told to stop"
+    assert dog._thread is not None and not dog._thread.is_alive(), \
+        "stop() must join the thread, not just signal it"
