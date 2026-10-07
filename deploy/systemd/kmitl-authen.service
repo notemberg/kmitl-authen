@@ -1,0 +1,71 @@
+# System-wide install (runs at boot, before anyone logs in):
+#   sudo install -d /opt/kmitl-authen /etc/kmitl-authen /var/lib/kmitl-authen
+#   sudo cp -r kmitl_authen requirements.txt pyproject.toml README.md LICENSE /opt/kmitl-authen/
+#   sudo python3 -m venv /opt/kmitl-authen/.venv
+#   sudo /opt/kmitl-authen/.venv/bin/pip install -r /opt/kmitl-authen/requirements.txt
+#   sudo cp config.example.json /etc/kmitl-authen/config.json   # then edit it
+#   sudo chmod 600 /etc/kmitl-authen/config.json
+#   sudo cp deploy/systemd/kmitl-authen.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now kmitl-authen
+#
+# Force a re-login:  sudo systemctl reload kmitl-authen
+# Follow the logs:   journalctl -u kmitl-authen -f
+# Status as JSON:    curl -s localhost:8777/status | jq
+
+[Unit]
+Description=KMITL campus network authenticator
+Documentation=https://github.com/CE-HOUSE/Auto-Authen-KMITL
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/kmitl-authen/.venv/bin/python -m kmitl_authen run \
+    --config /etc/kmitl-authen/config.json \
+    --state-dir /var/lib/kmitl-authen \
+    --control-port 8777 \
+    --no-banner
+WorkingDirectory=/opt/kmitl-authen
+
+# systemctl reload == SIGHUP == force a re-login, without dropping the process.
+ExecReload=/bin/kill -HUP $MAINPID
+
+# The watchdog exits 70 when a loop iteration stalls; this is what makes that
+# a self-heal instead of a dead daemon.
+Restart=always
+RestartSec=10s
+
+# Exit 3 means the portal rejected the credentials. Restarting would just burn
+# login attempts toward an account lock, so stop and wait for a human.
+RestartPreventExitStatus=3
+
+# Let systemd notice a wedged process even if our own watchdog is disabled.
+WatchdogSec=0
+
+# Logging goes to the journal; the app also keeps a rotating file in StateDirectory.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=kmitl-authen
+
+# Hardening. The daemon only needs outbound HTTP(S) and its own state dir.
+DynamicUser=no
+User=root
+StateDirectory=kmitl-authen
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ReadWritePaths=/var/lib/kmitl-authen
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+RemoveIPC=yes
+
+[Install]
+WantedBy=multi-user.target

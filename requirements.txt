@@ -1,0 +1,6 @@
+# Runtime dependency. Pinned loosely so security fixes land on a reinstall.
+requests>=2.28,<3
+
+# Optional, but recommended: exact per-interface MAC detection. Without it the
+# script falls back to /sys/class/net, Windows `getmac`, then uuid.getnode().
+psutil>=5.9

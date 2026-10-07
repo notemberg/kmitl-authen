@@ -1,0 +1,29 @@
+# Per-user install, no root needed (runs when you are logged in; add
+# `loginctl enable-linger $USER` to keep it running after logout):
+#   python3 -m venv ~/.local/share/kmitl-authen/.venv
+#   ~/.local/share/kmitl-authen/.venv/bin/pip install .
+#   mkdir -p ~/.config/kmitl-authen && cp config.example.json ~/.config/kmitl-authen/config.json
+#   chmod 600 ~/.config/kmitl-authen/config.json
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/systemd/kmitl-authen.user.service ~/.config/systemd/user/kmitl-authen.service
+#   systemctl --user daemon-reload && systemctl --user enable --now kmitl-authen
+#
+# Force a re-login: systemctl --user reload kmitl-authen
+
+[Unit]
+Description=KMITL campus network authenticator (user)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/share/kmitl-authen/.venv/bin/python -m kmitl_authen run \
+    --config %h/.config/kmitl-authen/config.json \
+    --control-port 8777 \
+    --no-banner
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10s
+RestartPreventExitStatus=3
+
+[Install]
+WantedBy=default.target

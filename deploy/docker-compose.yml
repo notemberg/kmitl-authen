@@ -1,0 +1,44 @@
+# Usage:
+#   cp ../.env.example .env   # then edit it
+#   docker compose up -d
+#   docker compose logs -f
+#   docker compose exec kmitl-authen kmitl-authen relogin     # force a re-login
+#   docker compose exec kmitl-authen kmitl-authen status      # JSON status
+services:
+  kmitl-authen:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: kmitl-authen:2.0.0
+    container_name: kmitl-authen
+
+    # REQUIRED. The portal authorises a (source IP, MAC) pair, and a bridged
+    # container is NATed behind the host, so the session would be bound to the
+    # wrong address. Host networking also makes the control port reachable at
+    # 127.0.0.1:8777 on the host.
+    network_mode: host
+
+    env_file: .env
+
+    # restart:unless-stopped is what turns the watchdog's exit(70) into a
+    # self-heal. Exit 3 (bad credentials) restarts too, so fix the password
+    # rather than leaving it to loop: `docker compose logs` says which it was.
+    restart: unless-stopped
+
+    volumes:
+      - kmitl-state:/var/lib/kmitl-authen
+
+    # Log rotation at the Docker layer; the app also rotates its own file.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
+volumes:
+  kmitl-state:

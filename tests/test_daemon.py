@@ -1,0 +1,217 @@
+"""Loop-behaviour tests: the regressions that made the old script misbehave."""
+import time
+
+import pytest
+
+from kmitl_authen.config import Config
+from kmitl_authen.control import Controller
+from kmitl_authen.daemon import Daemon, State
+from kmitl_authen.portal import Outcome, Result
+from kmitl_authen.watchdog import Watchdog
+
+
+class ScriptedPortal:
+    """Stands in for ``Portal``; records calls and replays canned results."""
+
+    def __init__(self, online=False, login_result=None, heartbeat_result=None):
+        self.online = online
+        self.login_result = login_result or Result(Outcome.OK)
+        self.heartbeat_result = heartbeat_result or Result(Outcome.OK)
+        self.calls = []
+
+    def check_internet(self):
+        self.calls.append("probe")
+        return (True, "probe ok") if self.online else (False, "captive portal response")
+
+    def login(self, ip):
+        self.calls.append("login")
+        if self.login_result.ok:
+            self.online = True
+        return self.login_result
+
+    def heartbeat(self):
+        self.calls.append("heartbeat")
+        return self.heartbeat_result
+
+    def reset_connections(self, reason=""):
+        self.calls.append(f"reset:{reason.split(':')[0]}")
+
+    def close(self):
+        self.calls.append("close")
+
+
+@pytest.fixture
+def daemon(tmp_path):
+    cfg = Config(username="u", password="p", ip_address="10.0.0.1",
+                 heartbeat_interval=60, relogin_interval=0,
+                 backoff_initial=2, backoff_max=16, watchdog_timeout=0)
+    controller = Controller(tmp_path)
+    d = Daemon(cfg, "aabbccddeeff", tmp_path, controller, Watchdog(0, tmp_path))
+    return d
+
+
+def test_offline_tick_logs_in_then_sleeps(daemon):
+    daemon.portal = ScriptedPortal(online=False)
+    sleep_for, _ = daemon._tick(0.0)
+    assert "login" in daemon.portal.calls
+    assert sleep_for > 0, "every path through the loop must sleep"
+
+
+def test_failed_login_backs_off_and_never_busy_loops(daemon):
+    """The old `elif connection and not internet` branch retried with no sleep."""
+    daemon.portal = ScriptedPortal(online=False,
+                                   login_result=Result(Outcome.REJECTED, "nope"))
+    delays = []
+    for _ in range(5):
+        sleep_for, _ = daemon._tick(0.0)
+        delays.append(sleep_for)
+    assert all(d >= 1.0 for d in delays), f"a retry slept less than a second: {delays}"
+    assert max(delays) > min(delays), "backoff did not grow"
+    assert max(delays) <= daemon.cfg.backoff_max
+
+
+def test_successful_login_resets_backoff(daemon):
+    daemon.portal = ScriptedPortal(online=False,
+                                   login_result=Result(Outcome.REJECTED, "nope"))
+    for _ in range(4):
+        daemon._tick(0.0)
+    assert daemon.backoff > daemon.cfg.backoff_initial
+    daemon.portal = ScriptedPortal(online=True)
+    daemon._tick(time.monotonic() + 999)
+    assert daemon.backoff == daemon.cfg.backoff_initial
+
+
+def test_online_tick_heartbeats_and_schedules_the_next_one(daemon):
+    daemon.portal = ScriptedPortal(online=True)
+    sleep_for, next_hb = daemon._tick(0.0)
+    assert daemon.state == State.ONLINE
+    assert "heartbeat" in daemon.portal.calls
+    assert next_hb > time.monotonic()
+    assert sleep_for <= daemon.cfg.heartbeat_interval
+
+
+def test_online_tick_does_not_heartbeat_early(daemon):
+    daemon.portal = ScriptedPortal(online=True)
+    daemon._tick(time.monotonic() + 999)
+    assert "heartbeat" not in daemon.portal.calls
+
+
+def test_heartbeat_failure_triggers_immediate_relogin(daemon):
+    """The old loop waited another full interval before reacting."""
+    daemon.portal = ScriptedPortal(online=True,
+                                   heartbeat_result=Result(Outcome.REJECTED, "403"))
+    sleep_for, _ = daemon._tick(0.0)
+    assert daemon.portal.calls.count("login") == 1
+    assert sleep_for <= 5, "must re-check soon after a forced re-login"
+
+
+def test_forced_relogin_request_is_honoured_before_probing(daemon):
+    daemon.portal = ScriptedPortal(online=True)
+    daemon.controller.request_relogin("test")
+    daemon._tick(time.monotonic() + 999)
+    assert daemon.portal.calls[0].startswith("reset")
+    assert "login" in daemon.portal.calls
+    assert "probe" not in daemon.portal.calls
+    assert daemon.counters.forced_relogins_total == 1
+
+
+def test_forced_relogin_resets_the_connection_pool(daemon):
+    """A stale keep-alive socket is the other half of the Windows hang."""
+    daemon.portal = ScriptedPortal(online=True)
+    daemon.controller.request_relogin("test")
+    daemon._tick(0.0)
+    assert any(c.startswith("reset") for c in daemon.portal.calls)
+
+
+def test_scheduled_relogin_fires_after_the_interval(daemon):
+    daemon.cfg.relogin_interval = 100
+    daemon.portal = ScriptedPortal(online=True)
+    daemon.last_login = time.monotonic() - 200
+    daemon._tick(time.monotonic() + 999)
+    assert "login" in daemon.portal.calls
+
+
+def test_scheduled_relogin_does_not_fire_early(daemon):
+    daemon.cfg.relogin_interval = 100
+    daemon.portal = ScriptedPortal(online=True)
+    daemon.last_login = time.monotonic() - 10
+    daemon._tick(time.monotonic() + 999)
+    assert "login" not in daemon.portal.calls
+
+
+def test_credential_failures_stop_before_locking_the_account(daemon):
+    daemon.cfg.max_credential_failures = 3
+    daemon.portal = ScriptedPortal(
+        online=False, login_result=Result(Outcome.BAD_CREDENTIALS, "userPassError"))
+    for _ in range(6):
+        daemon._tick(0.0)
+        if daemon.state == State.BLOCKED:
+            break
+    assert daemon.state == State.BLOCKED
+    assert daemon.portal.calls.count("login") == 3
+
+
+def test_credential_cooldown_when_configured_to_keep_trying(daemon):
+    daemon.cfg.max_credential_failures = 2
+    daemon.cfg.exit_on_credential_failure = False
+    daemon.portal = ScriptedPortal(
+        online=False, login_result=Result(Outcome.BAD_CREDENTIALS, "userPassError"))
+    sleeps = [daemon._tick(0.0)[0] for _ in range(3)]
+    assert daemon.state != State.BLOCKED
+    assert max(sleeps) >= 600, "a credential cooldown must be long, not a retry storm"
+
+
+def test_max_login_attempts_is_actually_enforced(daemon):
+    """The old code only printed at `attempt == max`, and never stopped."""
+    daemon.cfg.max_login_attempts = 3
+    daemon.portal = ScriptedPortal(online=False,
+                                   login_result=Result(Outcome.NETWORK_ERROR, "timeout"))
+    sleeps = [daemon._tick(0.0)[0] for _ in range(4)]
+    assert daemon.portal.calls.count("login") == 3
+    assert sleeps[-1] == daemon.cfg.backoff_max
+
+
+def test_unexpected_exception_does_not_end_the_loop(daemon, monkeypatch):
+    """An unhandled exception used to kill the process outright."""
+    boom = {"count": 0}
+
+    def exploding_tick(_next_hb):
+        boom["count"] += 1
+        if boom["count"] <= 2:
+            raise RuntimeError("synthetic failure")
+        daemon.controller.request_shutdown("test-done")
+        return 0.0, 0.0
+
+    daemon.portal = ScriptedPortal(online=True)
+    monkeypatch.setattr(daemon, "_tick", exploding_tick)
+    monkeypatch.setattr(daemon.controller, "wait", lambda s: "timeout")
+    daemon.run()
+    assert daemon.counters.unexpected_errors_total == 2
+    assert daemon.state == State.STOPPED
+
+
+def test_status_never_leaks_the_password(daemon):
+    """``/status`` is served over HTTP, so it must not carry the secret."""
+    daemon.cfg.password = "very-distinctive-secret"
+    status = daemon.status()
+    assert "password" not in status
+    assert daemon.cfg.password not in str(status)
+
+
+def test_scheduled_relogin_measures_from_startup_when_never_logged_in(daemon):
+    """Starting up already authenticated must not disable the proactive refresh."""
+    daemon.cfg.relogin_interval = 100
+    daemon.portal = ScriptedPortal(online=True)
+    daemon.last_login = None
+    daemon.started_monotonic = time.monotonic() - 200
+    daemon._tick(time.monotonic() + 999)
+    assert "login" in daemon.portal.calls
+
+
+def test_no_scheduled_relogin_right_after_startup(daemon):
+    daemon.cfg.relogin_interval = 100
+    daemon.portal = ScriptedPortal(online=True)
+    daemon.last_login = None
+    daemon.started_monotonic = time.monotonic()
+    daemon._tick(time.monotonic() + 999)
+    assert "login" not in daemon.portal.calls

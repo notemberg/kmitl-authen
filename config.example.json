@@ -1,0 +1,29 @@
+{
+  "username": "65010000",
+  "password": "your-password",
+
+  "_comment_ip": "Leave ip_address out to auto-detect the source address toward the portal.",
+  "ip_address": "",
+
+  "_comment_mac": "Leave mac_address out to detect once and pin it in the state dir.",
+  "mac_address": "",
+
+  "heartbeat_interval": 300,
+  "relogin_interval": 28800,
+
+  "connect_timeout": 5,
+  "read_timeout": 15,
+  "probe_timeout": 6,
+  "watchdog_timeout": 180,
+
+  "backoff_initial": 2,
+  "backoff_max": 120,
+  "max_credential_failures": 3,
+
+  "log_level": "INFO",
+  "log_json": false,
+
+  "control_host": "127.0.0.1",
+  "control_port": 8777,
+  "control_token": ""
+}

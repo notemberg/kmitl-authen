@@ -1,0 +1,2 @@
+# For platforms with no psutil wheel (MIPS routers, odd ARM builds).
+requests>=2.28,<3

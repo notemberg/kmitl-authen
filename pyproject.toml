@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kmitl-authen"
+version = "2.0.0"
+description = "Resilient captive-portal authenticator for the KMITL campus network"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+dependencies = [
+    "requests>=2.28,<3",
+]
+
+[project.optional-dependencies]
+# psutil makes MAC/interface detection exact; everything works without it.
+full = ["psutil>=5.9"]
+dev = ["pytest>=7", "psutil>=5.9"]
+
+[project.scripts]
+kmitl-authen = "kmitl_authen.cli:main"
+
+[tool.setuptools]
+packages = ["kmitl_authen"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

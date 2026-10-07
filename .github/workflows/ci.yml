@@ -1,0 +1,118 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: pytest (${{ matrix.os }}, py${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is in the matrix on purpose: the bugs this rewrite fixes were
+        # Windows-only, so a Windows failure must fail the build.
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install -e .
+
+      - name: Tests
+        run: python -m pytest -o addopts="" -v
+
+      - name: CLI smoke test
+        run: |
+          python -m kmitl_authen --version
+          python -m kmitl_authen run --help
+          python -m kmitl_authen relogin --help
+
+      - name: Daemon starts, logs, and shuts down cleanly (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          # No portal is reachable, so this exercises the offline/backoff path:
+          # it must stay alive, keep logging, and exit 0 on SIGTERM.
+          python -m kmitl_authen run \
+            -u ci-user -p ci-pass \
+            --state-dir "$RUNNER_TEMP/state" \
+            --probe-urls http://127.0.0.1:1/dead \
+            --login-url http://127.0.0.1:1/dead \
+            --connect-timeout 1 --read-timeout 2 --probe-timeout 1 \
+            --watchdog-timeout 30 --no-banner --log-level DEBUG &
+          PID=$!
+          sleep 12
+          kill -0 $PID || { echo "daemon died while offline"; exit 1; }
+          kill -TERM $PID
+          wait $PID; echo "clean exit: $?"
+          grep -q 'internet_unavailable' "$RUNNER_TEMP/state/kmitl-authen.log"
+          grep -q 'state_change' "$RUNNER_TEMP/state/kmitl-authen.log"
+
+      - name: Daemon starts, logs, and shuts down cleanly (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # The same check on Windows, where the old script used to wedge.
+          $state = Join-Path $env:RUNNER_TEMP 'state'
+          $p = Start-Process -PassThru -NoNewWindow python @(
+            '-m','kmitl_authen','run','-u','ci-user','-p','ci-pass',
+            '--state-dir',$state,
+            '--probe-urls','http://127.0.0.1:1/dead',
+            '--login-url','http://127.0.0.1:1/dead',
+            '--connect-timeout','1','--read-timeout','2','--probe-timeout','1',
+            '--watchdog-timeout','30','--no-banner','--log-level','DEBUG')
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "daemon exited early with $($p.ExitCode)" }
+          $log = Join-Path $state 'kmitl-authen.log'
+          if (-not (Test-Path $log)) { throw "no log file at $log" }
+          $text = Get-Content $log -Raw
+          foreach ($needle in 'internet_unavailable','state_change','probe_error') {
+            if ($text -notmatch [regex]::Escape($needle)) { throw "log is missing '$needle'" }
+          }
+          # It must still be looping, not stuck on one blocked request.
+          $ticks = ([regex]::Matches($text, 'probe_error')).Count
+          Write-Host "probe attempts in 20s: $ticks"
+          if ($ticks -lt 2) { throw "the loop stalled: only $ticks probe attempts" }
+          Stop-Process -Id $p.Id -Force
+
+      - name: Trigger-file re-login works with no daemon running
+        shell: bash
+        run: |
+          python -m kmitl_authen relogin --state-dir "$RUNNER_TEMP/trig" --url "" || true
+          test -f "$RUNNER_TEMP/trig/relogin"
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build the image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: false
+          load: true
+          tags: kmitl-authen:ci
+      - name: The image runs and prints its version
+        run: docker run --rm kmitl-authen:ci --version
+      - name: The image refuses to start without credentials
+        run: |
+          set +e
+          docker run --rm kmitl-authen:ci run
+          code=$?
+          set -e
+          test "$code" -eq 2 || { echo "expected exit 2, got $code"; exit 1; }
