@@ -374,6 +374,79 @@ DEBUG probe_error url=http://.../probe reason=read_timeout
 
 ---
 
+## Appendix: the real portal response, observed
+
+Run on the campus network, 2026-10-07 16:53, Windows 10 / Python 3.12.5.
+This settles the "inferred, not observed" column.
+
+```json
+{
+  "isEscape": false,
+  "data": {},
+  "enableAutoVerify": false,
+  "token": "db91cb19...a372c1c",
+  "success": true,
+  "tempPassEnable": false,
+  "psessionid": "7df7b9da...1dd88e",
+  "netSwitchStatus": 0
+}
+```
+
+The heartbeat answers **HTTP 200 with a completely empty body**.
+
+### What this confirms
+
+| Guess | Verdict |
+|---|---|
+| `success` is the verdict field | Correct, and it is a real boolean |
+| Not consulting `code` / `status` | Correct, and necessary — **neither field exists**, so reading them could only ever have produced a wrong answer |
+| `data` is unsafe to index | Correct: `data` is `{}`, so the old `content_dict['data']` survived by luck, and would have raised the moment the portal changed |
+| A token is issued | Correct: 64 hex characters, plus a separate `psessionid` that also arrives as a `PSESSIONID` cookie |
+
+All of it is now a fixture in `tests/test_portal.py` (`REAL_LOGIN_BODY`), so a
+future change to the classifier is checked against what the portal actually
+sends rather than against another guess.
+
+### A correction to finding 5
+
+Earlier in this document I inferred from the 122 "Portal rejected the login
+attempt." lines that the real portal returns a 200 with falsy `success` on
+logins that work. **That was wrong.** On a working login `success` is `true`.
+
+So those 122 lines were real rejections. During the nine-second storm the
+portal was answering `success: false` to nearly every request, and only
+accepted one at the end. That makes finding 5 worse, not better: the hammering
+was not merely rude, it was actively counter-productive — the portal was
+refusing the flood, and the script's only escape was to keep flooding until
+something got through.
+
+### A bug this found
+
+`_capture_token()` put the token into `session.headers`, and `requests` sends
+session headers to **every** host a session talks to. The portal is
+`portal.kmitl.ac.th`; the heartbeat is `nani.csc.kmitl.ac.th` — a different
+host. So the login token was being sent to the heartbeat host every 300
+seconds. Both are KMITL, so the severity is low, but it is the same mistake as
+the probe sharing the portal session, which this document already lists.
+
+The token is now held on the `Portal` instance and attached per request by
+`_portal_headers()`, to portal calls only. Asserted by
+`test_heartbeat_does_not_carry_the_portal_token`.
+
+### What the campus run did NOT test
+
+The machine was already authenticated by the old script, so every probe in
+section [2] passed *before* the login in section [3]. The login was therefore
+exercised from an already-online state, which tells us the portal is happy to
+re-authenticate an active session — useful, but not the path that matters.
+
+**Logging in from a de-authenticated state is still untested.**
+`doctor --full-cycle` is for exactly this: it logs out, confirms the portal has
+started blocking, then logs back in and confirms recovery. A plain `doctor` run
+now says so in its verdict instead of reporting a clean pass.
+
+---
+
 ## Summary
 
 | # | Problem | Guardrail |
@@ -391,3 +464,6 @@ DEBUG probe_error url=http://.../probe reason=read_timeout
 | 11 | An 80-minute silent gap, cause unknowable | Gap detection: both clock deltas logged, forced re-login |
 | 12 | *(introduced here)* watchdog fired during a normal 300 s sleep | `expected_idle` grace + a test against the shipped defaults |
 | 13 | *(introduced here)* a read timeout reported as `connection_error` | custom `Retry` removed; the whole cause chain is inspected |
+| 14 | *(introduced here)* the portal token sent to the heartbeat host | held per-instance, attached per request to portal calls only |
+| 15 | *(introduced here)* `doctor` printed the response body twice | `detail` carries the reason, `body` carries the body |
+| 16 | *(introduced here)* `config` exited silently on Ctrl+C, looking like a crash | explicit "Cancelled", username validation, `getpass` fallback |

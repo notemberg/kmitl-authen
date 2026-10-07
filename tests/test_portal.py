@@ -149,11 +149,94 @@ def test_heartbeat_non_200_is_rejected(portal, monkeypatch):
     assert not result.ok
 
 
-def test_token_is_captured_into_session_headers(portal, monkeypatch):
-    _stub(portal, monkeypatch,
-          FakeResponse(200, json.dumps({"success": True, "token": "abc123"})))
-    portal.login("10.0.0.1")
-    assert portal.session.headers["X-XSRF-TOKEN"] == "abc123"
+# The real login response, captured on the KMITL campus network, 2026-10-07.
+# Everything below this line is checked against what the portal actually sends,
+# not against a guess.
+REAL_LOGIN_BODY = json.dumps({
+    "isEscape": False,
+    "data": {},
+    "enableAutoVerify": False,
+    "token": "db91cb193c19b5a65517484558fcdac33e3543b6164f7cd345369f770a372c1c",
+    "success": True,
+    "tempPassEnable": False,
+    "psessionid": "7df7b9daae317dffcbec605399f0281e7ddc8778211dd88e",
+    "netSwitchStatus": 0,
+})
+
+
+def test_real_login_response_is_accepted(portal, monkeypatch):
+    _stub(portal, monkeypatch, FakeResponse(200, REAL_LOGIN_BODY))
+    result = portal.login("161.246.5.195")
+    assert result.outcome == Outcome.OK
+    assert result.ok
+
+
+def test_real_login_response_has_no_code_or_status_field(portal, monkeypatch):
+    """Justifies not consulting them: they do not exist, so reading them could
+    only ever have produced a wrong verdict."""
+    payload = json.loads(REAL_LOGIN_BODY)
+    assert "code" not in payload and "status" not in payload
+    assert "success" in payload
+
+
+def test_token_is_not_pinned_to_session_headers(portal, monkeypatch):
+    """The heartbeat is on a different host; a session header would reach it.
+
+    portal.kmitl.ac.th issues the token, nani.csc.kmitl.ac.th serves the
+    heartbeat. requests sends session headers to every host, so the token has
+    to be attached per request instead.
+    """
+    _stub(portal, monkeypatch, FakeResponse(200, REAL_LOGIN_BODY))
+    portal.login("161.246.5.195")
+    assert portal.token.startswith("db91cb19")
+    assert "X-XSRF-TOKEN" not in portal.session.headers
+
+
+def test_token_is_sent_on_portal_calls(portal, monkeypatch):
+    seen = []
+
+    def fake(self, method, url, **kwargs):
+        seen.append(kwargs.get("headers") or {})
+        return FakeResponse(200, REAL_LOGIN_BODY)
+
+    monkeypatch.setattr(requests.Session, "request", fake)
+    portal.login("161.246.5.195")          # no token yet on the first call
+    portal.login("161.246.5.195")          # second call carries it
+    assert "X-XSRF-TOKEN" not in seen[0]
+    assert seen[1]["X-XSRF-TOKEN"].startswith("db91cb19")
+
+
+def test_heartbeat_does_not_carry_the_portal_token(portal, monkeypatch):
+    _stub(portal, monkeypatch, FakeResponse(200, REAL_LOGIN_BODY))
+    portal.login("161.246.5.195")
+
+    seen = {}
+
+    def fake(self, method, url, **kwargs):
+        seen.update(kwargs.get("headers") or {})
+        seen["_session_headers"] = dict(self.headers)
+        return FakeResponse(200, "")
+
+    monkeypatch.setattr(requests.Session, "request", fake)
+    portal.heartbeat()
+    assert "X-XSRF-TOKEN" not in seen
+    assert "X-XSRF-TOKEN" not in seen["_session_headers"]
+
+
+def test_real_heartbeat_response_is_accepted(portal, monkeypatch):
+    """Observed: HTTP 200 with a completely empty body."""
+    _stub(portal, monkeypatch, FakeResponse(200, ""))
+    result = portal.heartbeat()
+    assert result.ok
+    assert result.body == ""
+
+
+def test_rebuilding_the_session_drops_the_token(portal, monkeypatch):
+    _stub(portal, monkeypatch, FakeResponse(200, REAL_LOGIN_BODY))
+    portal.login("161.246.5.195")
+    assert portal.token
+    portal.reset_connections("test")
+    assert portal.token == ""
 
 
 def test_probe_uses_a_separate_session_from_the_portal(portal):
@@ -240,12 +323,18 @@ def test_explicit_success_false_is_still_honoured(portal, monkeypatch):
     assert not result.fatal, "a plain rejection must not stop the daemon"
 
 
-def test_login_body_is_preserved_in_the_detail_for_diagnosis(portal, monkeypatch):
-    """Without campus access the real body shape is unknown; log it verbatim."""
+def test_body_goes_in_body_and_the_reason_goes_in_detail(portal, monkeypatch):
+    """`doctor` prints both, so they must not be the same string.
+
+    detail fell back to the body when the classifier had no reason to give,
+    which made doctor print the whole JSON twice under two labels.
+    """
     body = '{"weird": "shape", "gate": "opened"}'
     _stub(portal, monkeypatch, FakeResponse(200, body))
     result = portal.login("10.0.0.1")
-    assert "weird" in result.detail
+    assert result.body == body
+    assert result.detail == "success=true"
+    assert result.detail != result.body
 
 
 def test_raw_body_is_always_kept_even_when_a_verdict_is_inferred(portal, monkeypatch):

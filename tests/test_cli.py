@@ -135,3 +135,53 @@ def test_doctor_is_a_known_subcommand():
 def test_doctor_no_login_flag():
     args = cli.build_parser().parse_args(["doctor", "--no-login"])
     assert args.no_login is True
+
+
+def test_config_cancelled_by_ctrl_c_writes_nothing(tmp_path, monkeypatch, capsys):
+    """A silent exit after the username prompt looked exactly like a crash."""
+    target = tmp_path / "config.json"
+    monkeypatch.setattr("builtins.input", lambda _="": (_ for _ in ()).throw(KeyboardInterrupt))
+    args = cli.build_parser().parse_args(["config", "--path", str(target)])
+    assert cli.cmd_config(args) == 0
+    assert "Cancelled" in capsys.readouterr().out
+    assert not target.exists()
+
+
+def test_config_rejects_an_ip_typed_as_a_username(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "config.json"
+    answers = iter(["161.246.5.19", "", "", "", ""])
+    monkeypatch.setattr("builtins.input", lambda _="": next(answers))
+    monkeypatch.setattr(cli, "_prompt_password", lambda: "secret")
+    args = cli.build_parser().parse_args(["config", "--path", str(target)])
+    assert cli.cmd_config(args) == 2
+    assert "looks like an IP address" in capsys.readouterr().out
+    assert not target.exists()
+
+
+def test_config_strips_an_email_domain(tmp_path, monkeypatch):
+    target = tmp_path / "config.json"
+    answers = iter(["66011374@kmitl.ac.th", "", "", "", ""])
+    monkeypatch.setattr("builtins.input", lambda _="": next(answers))
+    monkeypatch.setattr(cli, "_prompt_password", lambda: "secret")
+    args = cli.build_parser().parse_args(["config", "--path", str(target)])
+    assert cli.cmd_config(args) == 0
+    assert json.loads(target.read_text())["username"] == "66011374"
+
+
+def test_config_requires_a_password(tmp_path, monkeypatch, capsys):
+    target = tmp_path / "config.json"
+    answers = iter(["66011374", "", "", "", ""])
+    monkeypatch.setattr("builtins.input", lambda _="": next(answers))
+    monkeypatch.setattr(cli, "_prompt_password", lambda: "")
+    args = cli.build_parser().parse_args(["config", "--path", str(target)])
+    assert cli.cmd_config(args) == 2
+    assert "required" in capsys.readouterr().out
+
+
+def test_password_prompt_falls_back_when_getpass_fails(monkeypatch, capsys):
+    """getpass can fail on some Windows terminals; it must not abort the command."""
+    monkeypatch.setattr(cli.getpass, "getpass",
+                        lambda _: (_ for _ in ()).throw(OSError("no console")))
+    monkeypatch.setattr("builtins.input", lambda _="": "typed-visibly")
+    assert cli._prompt_password() == "typed-visibly"
+    assert "cannot hide input" in capsys.readouterr().out

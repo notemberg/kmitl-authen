@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import time
 import json
 import sys
 import urllib.error
@@ -63,6 +64,10 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_arguments(probe)
     probe.add_argument("--no-login", dest="no_login", action="store_true",
                        help="probe and report only; do not attempt a login")
+    probe.add_argument("--full-cycle", dest="full_cycle", action="store_true",
+                       help="log OUT first, confirm the portal blocks you, then log "
+                            "back in. This is the only way to test the path that "
+                            "matters; a plain run while already online cannot.")
 
     return parser
 
@@ -296,15 +301,47 @@ def cmd_logout(args: argparse.Namespace) -> int:
         portal.close()
 
 
+def _prompt_password() -> str:
+    """Read a password without echo, falling back to a visible prompt.
+
+    getpass() can fail on some Windows terminals. When it does it raises or
+    warns, and a bare call would abort the whole command after the username
+    prompt -- which looks indistinguishable from a crash.
+    """
+    try:
+        return getpass.getpass("Password (not shown as you type): ")
+    except (getpass.GetPassWarning, OSError, EOFError) as exc:
+        print(f"  ! cannot hide input on this terminal ({exc}); it will be visible.")
+        return input("Password: ")
+
+
 def cmd_config(args: argparse.Namespace) -> int:
     path = Path(args.path).expanduser()
-    print(f"Writing {path}. Leave a field blank to keep the default.\n")
-    username = input("Username (student ID, without @kmitl.ac.th): ").strip()
-    password = getpass.getpass("Password: ")
-    ip_address = input("IP address to claim [auto-detect]: ").strip()
-    mac_address = input("MAC address [auto-detect and pin]: ").strip()
-    interval = input("Heartbeat interval in seconds [300]: ").strip()
-    port = input("Control server port, for status/relogin [8777]: ").strip()
+    print(f"Writing {path}. Leave a field blank to keep the default.")
+    print("Press Ctrl+C at any time to cancel without writing anything.\n")
+    try:
+        username = input("Username (student ID, without @kmitl.ac.th): ").strip()
+        password = _prompt_password()
+        ip_address = input("IP address to claim [auto-detect]: ").strip()
+        mac_address = input("MAC address [auto-detect and pin]: ").strip()
+        interval = input("Heartbeat interval in seconds [300]: ").strip()
+        port = input("Control server port, for status/relogin [8777]: ").strip()
+    except (KeyboardInterrupt, EOFError):
+        print("\n\nCancelled. Nothing was written"
+              f"{'; ' + str(path) + ' is unchanged' if path.exists() else ''}.")
+        return EXIT_OK
+
+    if not username or not password:
+        print("\nA username and password are both required; nothing was written.")
+        return EXIT_CONFIG
+    if username.count(".") == 3 and username.replace(".", "").isdigit():
+        print(f"\n'{username}' looks like an IP address, not a username.")
+        print("The username is your student ID, without @kmitl.ac.th.")
+        print("Nothing was written; run the command again.")
+        return EXIT_CONFIG
+    if "@" in username:
+        username = username.split("@", 1)[0]
+        print(f"  (dropped the domain; using '{username}')")
 
     data: dict[str, object] = {}
     if username:
@@ -372,7 +409,32 @@ def cmd_doctor(args: argparse.Namespace) -> int:
             print("\n[3] login  : skipped (--no-login)")
             return EXIT_OK
 
-        print("\n[3] login -- THIS IS THE PART THAT WAS NEVER TESTED FOR REAL")
+        if args.full_cycle:
+            if not online:
+                print("\n[3] logout : skipped, already behind the portal")
+            else:
+                print("\n[3] logout -- getting to a known de-authenticated state")
+                # Log in first so the session holds the portal's token; a fresh
+                # process has no session, and logout may need one.
+                primed = portal.login(cfg.ip_address or detected_ip)
+                print(f"    priming login  : {primed.outcome} (HTTP {primed.status_code})")
+                bye = portal.logout()
+                print(f"    logout         : {bye.outcome} (HTTP {bye.status_code})")
+                print(f"    RAW BODY       : {bye.body or '(empty)'}")
+                portal.reset_connections("doctor_full_cycle")
+                time.sleep(2)
+                online, detail = portal.check_internet()
+                print(f"    now offline?   : "
+                      f"{'YES - good, the portal is blocking us' if not online else 'NO - logout did not take effect'}"
+                      f"  ({detail})")
+                if online:
+                    print("\n    Cannot test the de-authenticated path: the portal still")
+                    print("    lets traffic through after a logout. Disconnect from the")
+                    print("    network and reconnect, then run this again.")
+
+        label = ("[4] login FROM A DE-AUTHENTICATED STATE" if args.full_cycle
+                 else "[3] login (from the state the machine is already in)")
+        print(f"\n{label}")
         result = portal.login(cfg.ip_address or detected_ip)
         print(f"    HTTP status    : {result.status_code}")
         print(f"    latency        : {result.latency_ms} ms")
@@ -381,23 +443,29 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         print(f"    why             : {result.detail or '(no reason recorded)'}")
         print(f"    RAW BODY        : {result.body or '(empty)'}")
         print("\n    ^ if 'my verdict' disagrees with whether you end up online,")
-        print("      the RAW BODY line is the thing to share -- the verdict is")
-        print("      inferred from field names that were guessed, not observed.")
+        print("      the RAW BODY line is the thing to share.")
 
-        print("\n[4] heartbeat")
+        print("\n[5] heartbeat" if args.full_cycle else "\n[4] heartbeat")
         beat = portal.heartbeat()
         print(f"    HTTP status    : {beat.status_code}")
         print(f"    my verdict     : {beat.outcome}")
         print(f"    RAW BODY        : {beat.body or '(empty)'}")
 
-        print("\n[5] connectivity after login")
+        print("\n[6] connectivity after login" if args.full_cycle
+              else "\n[5] connectivity after login")
         online, detail = portal.check_internet()
         print(f"    {'OK  ' if online else 'FAIL'} {detail}")
+
         print("\n" + "=" * 72)
-        if online:
-            print("Result: online. The daemon will work.")
+        if online and args.full_cycle:
+            print("Result: logged out, confirmed blocked, logged back in, online.")
+            print("That is the full cycle. The daemon will work.")
+        elif online:
+            print("Result: online -- but you were ALREADY online before [3], so this")
+            print("did not test logging in from a de-authenticated state, which is")
+            print("the path that actually matters. Run: kmitl-authen doctor --full-cycle")
         else:
-            print("Result: NOT online. Share sections [3] and [4] above.")
+            print("Result: NOT online. Share the RAW BODY lines above.")
         print("=" * 72)
         return EXIT_OK if online else 1
     finally:
@@ -433,4 +501,5 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{PROG}: configuration error: {exc}", file=sys.stderr)
         return EXIT_CONFIG
     except KeyboardInterrupt:
+        print(f"\n{PROG}: cancelled.", file=sys.stderr)
         return EXIT_OK

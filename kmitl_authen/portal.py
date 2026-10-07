@@ -147,6 +147,7 @@ class Portal:
             (cfg.connect_timeout, cfg.probe_timeout), cfg.user_agent, cfg.verify_tls
         )
         self._probe_index = 0
+        self.token = ""
 
     # -- lifecycle ---------------------------------------------------------
     def reset_connections(self, reason: str = "") -> None:
@@ -160,6 +161,7 @@ class Portal:
                 name,
                 netutil.build_session(timeout, self.cfg.user_agent, self.cfg.verify_tls),
             )
+        self.token = ""     # the old session's token died with its cookies
         log.debug("session_rebuilt", extra={"reason": reason or "unspecified"})
 
     def close(self) -> None:
@@ -248,11 +250,7 @@ class Portal:
             response = self.session.post(
                 self.cfg.login_url,
                 params=params,
-                headers={
-                    "Origin": "https://portal.kmitl.ac.th:19008",
-                    "Referer": "https://portal.kmitl.ac.th:19008/",
-                    "X-Requested-With": "XMLHttpRequest",
-                },
+                headers=self._portal_headers(),
             )
         except requests.exceptions.RequestException as exc:
             return Result(
@@ -277,11 +275,21 @@ class Portal:
 
         outcome, detail = _classify(payload, snippet)
         self._capture_token(payload)
-        return Result(outcome, detail or snippet[:160], response.status_code, latency,
-                      body=snippet)
+        if not detail:
+            # Say why in a few words. Falling back to the body here made
+            # `doctor` print the same JSON twice, under "why" and "RAW BODY".
+            detail = "success=true" if outcome == Outcome.OK else outcome
+        return Result(outcome, detail, response.status_code, latency, body=snippet)
 
     def _capture_token(self, payload: dict[str, Any] | None) -> None:
-        """Carry an anti-CSRF token forward if the portal issued one."""
+        """Remember the portal's token, WITHOUT pinning it to session headers.
+
+        The observed login response carries a 64-hex ``token`` and a
+        ``psessionid``. Putting the token in ``session.headers`` would send it
+        to every host the session talks to -- and the heartbeat lives on
+        nani.csc.kmitl.ac.th, a different host from portal.kmitl.ac.th. It is
+        held here instead and attached per request, to portal calls only.
+        """
         token = ""
         if payload:
             for key in ("token", "xsrfToken", "csrfToken"):
@@ -291,9 +299,22 @@ class Portal:
                     break
         if not token:
             token = self.session.cookies.get("XSRF-TOKEN") or ""
+        # A stale header from an earlier build, or an earlier login, must go.
+        self.session.headers.pop("X-XSRF-TOKEN", None)
         if token:
-            self.session.headers["X-XSRF-TOKEN"] = token
-            log.debug("xsrf_token_captured")
+            self.token = token
+            log.debug("portal_token_captured", extra={"length": len(token)})
+
+    def _portal_headers(self) -> dict[str, str]:
+        """Headers for portal.kmitl.ac.th only."""
+        headers = {
+            "Origin": "https://portal.kmitl.ac.th:19008",
+            "Referer": "https://portal.kmitl.ac.th:19008/",
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        if self.token:
+            headers["X-XSRF-TOKEN"] = self.token
+        return headers
 
     def heartbeat(self) -> Result:
         started = time.monotonic()
@@ -326,16 +347,10 @@ class Portal:
 
     def logout(self) -> Result:
         started = time.monotonic()
-        headers = {
-            "Origin": "https://portal.kmitl.ac.th:19008",
-            "Referer": "https://portal.kmitl.ac.th:19008/",
-            "X-Requested-With": "XMLHttpRequest",
-        }
-        token = self.session.cookies.get("XSRF-TOKEN")
-        if token:
-            headers["X-XSRF-TOKEN"] = token
         try:
-            response = self.session.post(self.cfg.logout_url, headers=headers, data="")
+            response = self.session.post(
+                self.cfg.logout_url, headers=self._portal_headers(), data=""
+            )
         except requests.exceptions.RequestException as exc:
             return Result(
                 Outcome.NETWORK_ERROR,

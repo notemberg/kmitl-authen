@@ -26,7 +26,7 @@ by bug, with the line numbers and the test that now prevents each one.
 | Observability | `print()` + ASCII art | rotating + JSON logs, `/status`, `/metrics`, `/healthz` |
 | Identity | `uuid.getnode()`, could change | interface-aware and pinned |
 | Deployment | run it in a terminal | Docker, systemd, Windows Task, RouterOS |
-| Tests | none | 129 |
+| Tests | none | 140 |
 
 ---
 
@@ -38,8 +38,12 @@ the real portal's request and response shapes are *inferred* from the previous
 script and from a run log. `doctor` is how you check that in one shot:
 
 ```bash
-python3 -m kmitl_authen doctor
+python3 -m kmitl_authen doctor               # Windows: python -m kmitl_authen doctor
+python3 -m kmitl_authen doctor --full-cycle  # log out, confirm blocked, log back in
 ```
+
+> On Windows use `python` or `py -3`. There is no `python3` command, and typing
+> it opens the Microsoft Store.
 
 It prints the identity it would present, each connectivity probe, and then the
 **raw body** the portal returns for a login and a heartbeat, next to the
@@ -314,7 +318,7 @@ State, logs and the pinned identity live in:
 
 Being straight about this, because the failure modes here are subtle.
 
-**Tested, and would fail the build if broken** — 129 tests plus CI on Linux,
+**Tested, and would fail the build if broken** — 140 tests plus CI on Linux,
 Windows and macOS across Python 3.9/3.11/3.13:
 
 - every request carries a timeout (asserted below our own session wrapper)
@@ -328,14 +332,29 @@ Windows and macOS across Python 3.9/3.11/3.13:
 - clean exit 0 on `SIGTERM`, exit 2 on a bad config, exit 3 on bad credentials
 - the Docker health check, in both the healthy and unhealthy directions
 
-**Inferred, not observed** — this needs `doctor` on campus:
+**Confirmed on campus**, 2026-10-07, Windows 10 / Python 3.12.5 — the real
+login response is now a test fixture (`REAL_LOGIN_BODY` in `tests/test_portal.py`):
+
+```json
+{"isEscape": false, "data": {}, "enableAutoVerify": false,
+ "token": "db91cb19...", "success": true, "tempPassEnable": false,
+ "psessionid": "7df7b9da...", "netSwitchStatus": 0}
+```
+
+`success` is the verdict field and it is a real boolean. `code` and `status` do
+not exist, so ignoring them was necessary rather than merely cautious. The
+heartbeat answers HTTP 200 with an empty body. MAC detection and pinning work
+on Windows, and the box-drawing banner renders in PowerShell without the
+`UnicodeEncodeError` that killed the old script.
+
+**Still not observed:**
 
 | | |
 |---|---|
-| The login response shape | `portal._classify()` trusts only `success` and `result`. `code` and `status` are deliberately ignored, because `code: 0` means success in some portal APIs and failure in others. An unrecognised body is reported as OK and the probe decides. |
-| Whether `success` is even present | The run log shows `newauthen.py` printing "Portal rejected" 122 times on HTTP 200s, then coming online — so a 200 with falsy `success` happened on logins that worked. If that is the normal success shape, `doctor` will show `my verdict: rejected` alongside `[5] OK`, and the daemon still works because the probe outranks the body. |
-| Credential-error wording | `_CREDENTIAL_MARKERS` is a guess at the real strings. A false positive here only costs a backoff, never a stop, because the circuit breaker needs **consecutive** failures and any confirmed connectivity clears the streak. |
+| Logging in from a **de-authenticated** state | The campus run was already authenticated, so the login was exercised from an already-online state. Run `kmitl-authen doctor --full-cycle`: it logs out, confirms the portal blocks you, then logs back in. |
+| Credential-error wording | `_CREDENTIAL_MARKERS` is a guess at the real strings. A false positive only costs a backoff, never a stop: the circuit breaker needs **consecutive** failures and any confirmed connectivity clears the streak. |
 | `acip` | Carried over as `10.252.13.10` from the old script. |
+| `netSwitchStatus`, `isEscape`, `tempPassEnable` | Present in the response, meaning unknown, ignored. |
 
 **Not tested at all:**
 
@@ -352,7 +371,7 @@ Windows and macOS across Python 3.9/3.11/3.13:
 
 ```bash
 python3 -m pip install -r requirements-dev.txt
-python3 -m pytest                 # 129 tests, no network needed
+python3 -m pytest                 # 140 tests, no network needed
 ```
 
 Layout:
